@@ -69,7 +69,9 @@ class AuditPanel(QWidget):
     def refresh(self):
         if not self.case:
             self.tbl.setRowCount(0)
-            self.lbl_status.setText("")
+            self.lbl_status.setText(
+                "No case loaded — open or create a case to view its audit log."
+            )
             return
         rows = self.case.audit_rows(limit=self.spin.value())
         self.tbl.setRowCount(len(rows))

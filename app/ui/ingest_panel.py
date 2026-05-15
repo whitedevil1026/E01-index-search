@@ -19,6 +19,7 @@ from app.core.hashing import hash_stream
 from app.core.hash_policy import HashPolicy
 from app.core.indexer import HAS_TANTIVY, Indexer
 from app.core.worker import Worker
+from app.ui.centered_msg import msg_error, msg_info, msg_question, msg_warn
 from app.ui.integrity_panel import quick_pre_flight
 
 
@@ -66,6 +67,12 @@ class IngestPanel(QWidget):
         btn_browse.setObjectName("secondary")
         btn_browse.clicked.connect(self._browse)
         btn_inspect = QPushButton("Inspect")
+        btn_inspect.setToolTip(
+            "Read the E01 header without scanning the whole file. Shows "
+            "format, segment count, size, and any MD5/SHA-1 written into "
+            "the header by the original acquisition tool. Enables the "
+            "Compute Now button."
+        )
         btn_inspect.clicked.connect(self._inspect)
         btn_integrity = QPushButton("Integrity Check")
         btn_integrity.setObjectName("secondary")
@@ -202,6 +209,12 @@ class IngestPanel(QWidget):
 
         run_row = QHBoxLayout()
         self.btn_run = QPushButton("Ingest into Case")
+        self.btn_run.setToolTip(
+            "Register the evidence row, walk every filesystem inside the "
+            "E01 with The Sleuth Kit, optionally hash each file with the "
+            "case hash policy, and index file names + paths into Tantivy. "
+            "All actions go into the audit log."
+        )
         self.btn_run.clicked.connect(self._run)
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setObjectName("danger")
@@ -330,8 +343,8 @@ class IngestPanel(QWidget):
 
     def _compute_policy_hashes(self):
         if not self.case or not self._segs:
-            QMessageBox.warning(self, "Inspect first",
-                                "Pick an E01 file and click Inspect before computing.")
+            msg_warn(self, "Inspect first",
+                     "Pick an E01 file and click Inspect before computing.")
             return
         policy = self.case.hash_policy()
         from app.core.hash_policy import hash_path_with_policy
@@ -430,13 +443,13 @@ class IngestPanel(QWidget):
     def _preflight_integrity(self):
         p = self.path_edit.text().strip()
         if not p or not Path(p).exists():
-            QMessageBox.warning(self, "Missing", "Pick an existing E01 file first.")
+            msg_warn(self, "Missing", "Pick an existing E01 file first.")
             return
         self._append_log("Running integrity pre-flight…")
         try:
             report = quick_pre_flight(p)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Integrity error", f"{type(exc).__name__}: {exc}")
+            msg_error(self, "Integrity error", f"{type(exc).__name__}: {exc}")
             return
         summary = report.summary
         msg_lines = [
@@ -460,14 +473,16 @@ class IngestPanel(QWidget):
                 "set": report.image_set,
                 **summary, "missing_segments": report.missing,
             })
-        icon = QMessageBox.Information if summary["complete"] else QMessageBox.Critical
-        mb = QMessageBox(icon, "Integrity pre-flight", "\n".join(msg_lines), parent=self)
-        mb.exec()
+        body = "\n".join(msg_lines)
+        if summary["complete"]:
+            msg_info(self, "Integrity pre-flight", body)
+        else:
+            msg_error(self, "Integrity pre-flight — INCOMPLETE", body)
 
     def _inspect(self):
         p = self.path_edit.text().strip()
         if not p or not Path(p).exists():
-            QMessageBox.warning(self, "Missing", "Pick an existing E01 file.")
+            msg_warn(self, "Missing", "Pick an existing E01 file.")
             return
         info = inspect(p)
         self._info = info
@@ -501,11 +516,11 @@ class IngestPanel(QWidget):
         if not self.case:
             return
         if not self._info or not self._segs:
-            QMessageBox.warning(self, "Inspect first",
-                                "Inspect an image before ingesting.")
+            msg_warn(self, "Inspect first",
+                     "Inspect an image before ingesting.")
             return
         if self._info.is_encrypted:
-            ret = QMessageBox.question(
+            ret = msg_question(
                 self, "Encrypted image",
                 "This looks like Ex01 (likely encrypted). libewf cannot "
                 "decrypt Ex01. Proceed and tag as 'encrypted, no usable text'?",
@@ -513,7 +528,7 @@ class IngestPanel(QWidget):
             if ret != QMessageBox.Yes:
                 return
         if not HAS_PYEWF or not HAS_PYTSK3:
-            ret = QMessageBox.question(
+            ret = msg_question(
                 self, "Missing forensic libs",
                 f"libewf-python installed: {HAS_PYEWF}\n"
                 f"pytsk3 installed: {HAS_PYTSK3}\n\n"

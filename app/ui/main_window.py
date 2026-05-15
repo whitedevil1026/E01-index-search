@@ -203,7 +203,7 @@ class MainWindow(QMainWindow):
         try:
             case = Case.open(Path(d))
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Error", f"Failed to open case:\n{exc}")
+            msg_error(self, "Error", f"Failed to open case:\n{exc}")
             return
         self.case = case
         self.case_changed.emit(case)

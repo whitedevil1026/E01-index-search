@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.hash_policy import HashPolicy, SUPPORTED_ALGOS, DEFAULT_PRIMARY, DEFAULT_EXTRAS
+from app.ui.centered_msg import msg_warn
 from app.ui.help_dialog import info_button
 
 
@@ -126,7 +127,7 @@ class NewCaseDialog(QDialog):
         """
         result = self.result_tuple()
         if isinstance(result, tuple) and result and result[0] == "error":
-            QMessageBox.warning(self, "Cannot create case", result[1])
+            msg_warn(self, "Cannot create case", result[1])
             return
         # success
         self.accept()

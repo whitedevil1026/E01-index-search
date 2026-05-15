@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.hash_policy import HashPolicy, SUPPORTED_ALGOS
+from app.ui.centered_msg import msg_info
 from app.ui.help_dialog import info_button
 
 
@@ -103,6 +104,11 @@ class CasePanel(QWidget):
             er.addWidget(cb)
         er.addStretch(1)
         btn_apply = QPushButton("Apply")
+        btn_apply.setToolTip(
+            "Save the selected primary + extra hash algorithms as this "
+            "case's policy. Applied to every later ingest, integrity check, "
+            "and Compute Now run."
+        )
         btn_apply.clicked.connect(self._apply_policy)
         er.addWidget(btn_apply)
         hpl.addRow("Change:", edit_row)
@@ -206,8 +212,8 @@ class CasePanel(QWidget):
                   if cb.isChecked() and cb.isEnabled() and a != primary]
         pol = HashPolicy(primary=primary, extras=extras).normalized()
         self.case.set_config("hash_policy", pol.to_json())
-        QMessageBox.information(self, "Hash policy updated",
-                                f"Active policy is now: {pol.describe()}")
+        msg_info(self, "Hash policy updated",
+                 f"Active policy is now: {pol.describe()}")
         self.refresh()
         mw = self.window()
         if hasattr(mw, "audit_panel"):

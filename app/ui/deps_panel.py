@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.deps import probe_all, missing
+from app.ui.centered_msg import msg_info, msg_question
 from app.ui.install_dialog import InstallDialog
 
 
@@ -49,12 +50,21 @@ class DepsPanel(QWidget):
 
         bar = QHBoxLayout()
         self.btn_install = QPushButton("Install Missing…")
+        self.btn_install.setToolTip(
+            "Run `python -m pip install` against the missing packages, "
+            "preferring the bundled wheels in ./wheels/ first so no MSVC "
+            "build tools are needed."
+        )
         self.btn_install.clicked.connect(self._open_installer)
         self.btn_refresh = QPushButton("Re-probe")
         self.btn_refresh.setObjectName("secondary")
         self.btn_refresh.clicked.connect(self.refresh)
         self.btn_copy = QPushButton("Copy pip commands for missing")
         self.btn_copy.setObjectName("secondary")
+        self.btn_copy.setToolTip(
+            "Copy the pip install commands for every missing dependency "
+            "to the clipboard, so you can paste them into a terminal."
+        )
         self.btn_copy.clicked.connect(self._copy_missing)
         bar.addWidget(self.btn_install)
         bar.addWidget(self.btn_refresh)
@@ -93,10 +103,10 @@ class DepsPanel(QWidget):
     def _copy_missing(self):
         m = missing()
         if not m:
-            QMessageBox.information(self, "Nothing missing", "All deps already installed.")
+            msg_info(self, "Nothing missing", "All deps already installed.")
             return
         QGuiApplication.clipboard().setText("\n".join(d.install_hint for d in m))
-        QMessageBox.information(
+        msg_info(
             self, "Copied",
             f"Copied {len(m)} pip command(s) to clipboard. "
             "Paste into a terminal to install.",
@@ -105,16 +115,15 @@ class DepsPanel(QWidget):
     def _open_installer(self):
         m = missing()
         if not m:
-            QMessageBox.information(self, "Nothing missing", "All deps already installed.")
+            msg_info(self, "Nothing missing", "All deps already installed.")
             return
-        ret = QMessageBox.question(
+        ret = msg_question(
             self, "Install missing dependencies",
             f"{len(m)} package(s) will be installed via pip using:\n"
             f"  {__import__('sys').executable}\n\n"
             "No admin rights are needed — packages install to user site-packages. "
             "You'll see the live pip output and you can cancel at any time.\n\n"
             "Proceed?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
         )
         if ret != QMessageBox.Yes:
             return

@@ -17,7 +17,7 @@ from __future__ import annotations
 import time
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.indexer import HAS_TANTIVY, Indexer
+from app.ui.centered_msg import msg_info
 from app.ui.help_dialog import info_button
 
 
@@ -141,9 +142,18 @@ class SearchPanel(QWidget):
         )
         root.addWidget(self.tbl, 1)
 
-        bottom = QLabel("Double-click any cell to copy its value.")
+        bottom = QLabel(
+            "Double-click any cell to copy its value. "
+            "Press <b>Ctrl+F</b> on this tab to jump straight to the query box."
+        )
         bottom.setObjectName("muted")
+        bottom.setTextFormat(Qt.RichText)
         root.addWidget(bottom)
+
+        # Ctrl+F focuses the query field when this panel is visible.
+        focus_q = QShortcut(QKeySequence("Ctrl+F"), self)
+        focus_q.setContext(Qt.WidgetWithChildrenShortcut)
+        focus_q.activated.connect(lambda: (self.q.setFocus(), self.q.selectAll()))
 
     # ---- state -------------------------------------------------------
 
@@ -152,7 +162,18 @@ class SearchPanel(QWidget):
         self.setEnabled(case is not None)
         if case is None:
             self.tbl.setRowCount(0)
-            self._set_status("Idle.", "muted")
+            self._set_status(
+                "No case loaded — use <b>File → New Case</b> (Ctrl+N) or "
+                "<b>Open Case</b> (Ctrl+O) on the toolbar to begin.",
+                "warn",
+            )
+        else:
+            self.tbl.setRowCount(0)
+            self._set_status(
+                f"Ready. Case '{case.meta().name}' loaded — type a query and "
+                f"press Enter (or Ctrl+F to focus this field).",
+                "muted",
+            )
 
     def _on_mode_change(self):
         mode = self.mode.currentData()
@@ -182,8 +203,8 @@ class SearchPanel(QWidget):
         if not self.case:
             return
         if not HAS_TANTIVY:
-            QMessageBox.information(self, "tantivy missing",
-                                    "Install tantivy-py to enable search.")
+            msg_info(self, "tantivy missing",
+                     "Install tantivy-py to enable search.")
             return
         q = self.q.text().strip()
         if not q:

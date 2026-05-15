@@ -26,6 +26,7 @@ from app.core.ewf_integrity import (
     format_report_txt, segment_index_from_ext,
 )
 from app.core.worker import Worker
+from app.ui.centered_msg import msg_error, msg_info, msg_warn
 from app.ui.exported_dialog import ExportedDialog
 
 
@@ -125,6 +126,13 @@ class IntegrityPanel(QWidget):
 
         run_row = QHBoxLayout()
         self.btn_run = QPushButton("Run Integrity Check")
+        self.btn_run.setToolTip(
+            "Walk every EWF segment in the chosen path: verify the EVF/LVF "
+            "signature, check the trailing Adler-32 descriptor, detect "
+            "missing E01/E02/… chunks, and (optionally) extract the case "
+            "metadata stored in the EWF header. Reads ~89 bytes per segment "
+            "so it's fast even over a network share."
+        )
         self.btn_run.clicked.connect(self._run)
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setObjectName("danger")
@@ -259,12 +267,11 @@ class IntegrityPanel(QWidget):
     def _run(self):
         path_text = self.path_edit.text().strip()
         if not path_text:
-            QMessageBox.warning(self, "Missing path",
-                                "Pick a folder or .E01 file first.")
+            msg_warn(self, "Missing path", "Pick a folder or .E01 file first.")
             return
         target = Path(path_text)
         if not target.exists():
-            QMessageBox.warning(self, "Not found", f"{target} does not exist.")
+            msg_warn(self, "Not found", f"{target} does not exist.")
             return
 
         # Build list of image sets
@@ -277,8 +284,8 @@ class IntegrityPanel(QWidget):
                 sets = [[target]]
 
         if not sets:
-            QMessageBox.information(self, "Nothing found",
-                                    "No E01 / L01 / Ex01 segments in that path.")
+            msg_info(self, "Nothing found",
+                     "No E01 / L01 / Ex01 segments in that path.")
             return
 
         # Reset UI
@@ -523,7 +530,7 @@ class IntegrityPanel(QWidget):
                 p.write_text(txt, encoding="utf-8")
                 written.append(str(p))
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Export failed", f"{type(exc).__name__}: {exc}")
+            msg_error(self, "Export failed", f"{type(exc).__name__}: {exc}")
             return
 
         if self.case:
