@@ -91,6 +91,41 @@ class MainWindow(QMainWindow):
         self.case_changed.connect(self._on_case_changed)
         self._on_case_changed(None)
 
+        # Accept dropped E01/Ex01/L01 files — drop anywhere on the
+        # window to jump to the Ingest tab with the path pre-filled.
+        self.setAcceptDrops(True)
+
+    # ---- drag-and-drop ---------------------------------------------------
+
+    def dragEnterEvent(self, event):
+        from app.core.ewf_integrity import ext_is_image
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    p = Path(url.toLocalFile())
+                    if p.is_file() and ext_is_image(p.suffix):
+                        event.acceptProposedAction()
+                        return
+        event.ignore()
+
+    def dropEvent(self, event):
+        from app.core.ewf_integrity import ext_is_image
+        for url in event.mimeData().urls():
+            if not url.isLocalFile():
+                continue
+            p = Path(url.toLocalFile())
+            if p.is_file() and ext_is_image(p.suffix):
+                self.ingest_panel.path_edit.setText(str(p))
+                self.tabs.setCurrentWidget(self.ingest_panel)
+                # auto-inspect for convenience
+                try:
+                    self.ingest_panel._inspect()
+                except Exception:
+                    pass
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
     # ---- chrome ----------------------------------------------------------
 
     def _build_toolbar(self):
@@ -130,6 +165,17 @@ class MainWindow(QMainWindow):
         act_sign_help.setToolTip("What is the Signed Manifest?")
         act_sign_help.triggered.connect(lambda: HelpDialog(self, key="sign_manifest").exec())
         tb.addAction(act_sign_help)
+
+        # Push the About action to the right edge of the toolbar.
+        from PySide6.QtWidgets import QSizePolicy
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        tb.addWidget(spacer)
+
+        act_about = QAction("About", self)
+        act_about.setToolTip("Tool version, license, third-party attribution.")
+        act_about.triggered.connect(lambda: HelpDialog(self, key="about").exec())
+        tb.addAction(act_about)
 
     def _build_tabs(self):
         self.tabs = QTabWidget()

@@ -9,7 +9,44 @@ from PySide6.QtWidgets import (
 )
 
 
+__VERSION__ = "1.0.0"
+
 HELP: dict[str, dict[str, str]] = {
+    "about": {
+        "title": "About — E01 Index & Search",
+        "body": f"""
+<h2>E01 Index &amp; Search</h2>
+<p><b>Version:</b> {__VERSION__}<br>
+<b>License:</b> Apache 2.0<br>
+<b>Source:</b> <a href="https://github.com/whitedevil1026/E01-index-search">github.com/whitedevil1026/E01-index-search</a></p>
+
+<h3>What it does</h3>
+<p>A self-contained desktop forensic indexer for <b>EWF / EnCase E01</b>
+images. Verify integrity, walk filesystems, hash with a court-defensible
+policy, and search by file name across cases &mdash; all through a
+PySide6 desktop app with a hash-chained audit log and Ed25519-signed
+manifest.</p>
+
+<h3>Built on</h3>
+<ul>
+<li><b>libewf-python</b> &mdash; E01 / Ex01 / L01 reader</li>
+<li><b>The Sleuth Kit / pytsk3</b> &mdash; filesystem walker</li>
+<li><b>tantivy-py</b> &mdash; Rust-based, Lucene-class search index</li>
+<li><b>cryptography</b> &mdash; Ed25519 manifest signing</li>
+<li><b>TLSH</b> &mdash; locality-sensitive fuzzy hash (Trend Micro)</li>
+<li><b>PySide6</b> &mdash; Qt 6 desktop GUI</li>
+</ul>
+
+<h3>Bundled wheels</h3>
+<p>The repo ships pre-built Windows wheels for <code>pytsk3</code> and
+<code>tlsh</code> so end users install in seconds with no Visual C++
+Build Tools. See the <b>Deps Status</b> tab.</p>
+
+<h3>License attribution</h3>
+<p>See the <code>NOTICE</code> file at the repo root for the full
+attribution required when redistributing.</p>
+""",
+    },
     "audit_chain": {
         "title": "Verify Audit Chain",
         "body": """

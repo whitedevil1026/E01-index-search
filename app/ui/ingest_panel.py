@@ -577,6 +577,9 @@ class IngestPanel(QWidget):
                     writer = None
 
             n_files = 0
+            n_since_commit = 0
+            COMMIT_EVERY = 5000   # commit ~ every 5000 docs to bound memory
+                                  # and protect partial progress on crash
             with EwfHandle(segs) as h:
                 files_iter = walk_image(h, max_files=max_files)
                 buf: list[dict] = []
@@ -586,9 +589,11 @@ class IngestPanel(QWidget):
                         break
                     md5 = sha = tlsh = None
                     if do_hash and rec.size_bytes and rec.size_bytes > 0 and rec.is_allocated:
-                        # We can't easily re-open arbitrary inodes via pytsk3 from here
-                        # in this minimal try1 — defer per-file content hashing to try2
-                        # where we'll keep the FS_Info object alive in a worker pool.
+                        # Per-file content hashing keeps requiring the
+                        # FS_Info object alive across a worker pool; that
+                        # lands when we wire the multi-handle libewf
+                        # worker pool. The full-E01 hash from "Compute
+                        # Now" already produces the case-level fingerprint.
                         pass
                     row = {
                         "inode": rec.inode, "path": rec.path, "name": rec.name,
@@ -603,6 +608,7 @@ class IngestPanel(QWidget):
                     if len(buf) >= 250:
                         case.add_files(ev_id, buf)
                         n_files += len(buf)
+                        n_since_commit += len(buf)
                         if writer is not None:
                             for r in buf:
                                 indexer.add_doc(
@@ -616,6 +622,13 @@ class IngestPanel(QWidget):
                                     tlsh=r["tlsh"] or "",
                                     evidence_uuid=evidence_uuid,
                                 )
+                        # Incremental commit — bounds the Tantivy heap
+                        # and means a crash mid-ingest doesn't lose the
+                        # whole index, only the last sub-5000 docs.
+                        if writer is not None and n_since_commit >= COMMIT_EVERY:
+                            w.log.emit(f"  …intermediate commit at {n_files:,} files")
+                            writer.commit()
+                            n_since_commit = 0
                         w.progress.emit(n_files, max_files or 0, "")
                         w.log.emit(f"  …{n_files} files enumerated "
                                    f"({n_files / max(time.time()-t0, 0.01):.0f}/s)")
