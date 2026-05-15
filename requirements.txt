@@ -1,0 +1,26 @@
+# Core UI
+PySide6>=6.6,<7
+
+# Crypto / signing — already installed in user's env
+cryptography>=42
+
+# Indexing — primary. 0.22+ has TextAnalyzerBuilder; 0.25.1 adds fast-field tokenizers.
+# Wheels available for cp310-cp312 on PyPI.
+tantivy>=0.22,<0.26
+
+# Encoding
+charset-normalizer>=3.4,<4   # MIT — preferred over chardet 7.x
+
+# Fuzzy hashing
+python-tlsh>=4.5             # actively maintained; ssdeep optional/secondary
+
+# Forensic stack — wheels exist on PyPI for cp310-cp312 on Windows/Linux/macOS
+# If install fails on Windows, see Deps Status panel in the app for fallback steps.
+libewf-python==20240506      # E01 reader; status: pre-alpha but de-facto standard
+pytsk3>=20230125             # Sleuth Kit binding
+
+# Optional (Phase 2+, not required for try1 to run):
+# pymupdf>=1.24
+# extract-msg>=0.50
+# libpff-python
+# yara-x>=1.0

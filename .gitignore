@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local case data — NEVER commit examiner cases or evidence
+cases/
+*.case/
+case.db
+case.db-wal
+case.db-shm
+manifest.json
+manifest.sig
+keys/case_ed25519.key
+keys/case_ed25519.pub
+evidence/
+
+# Forensic test images (large, not ours to redistribute)
+*.E0[0-9]
+*.E[1-9][0-9]
+*.E[A-Z][A-Z]
+*.Ex[0-9][0-9]
+*.Ex[A-Z][A-Z]
+*.L0[1-9]
+*.L[1-9][0-9]
+*.Lx[0-9][0-9]
+*.raw
+*.dd
+*.img
+*.001
+*.aff
+*.aff4
+
+# Reports / CSVs we might produce during smoke testing
+E01_IntegrityReport_*.csv
+E01_CaseInfo_*.csv
+E01_CaseReport_*.txt
+
+# pip / build leftovers
+pip-wheel-metadata/
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+desktop.ini
+
+# But DO commit the bundled wheels — they're the whole point of wheels/
+!wheels/
+!wheels/*.whl
