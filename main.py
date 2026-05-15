@@ -1,4 +1,4 @@
-"""E01 Indexing Tool — try1 entry point."""
+"""E01 Index & Search — application entry point."""
 from __future__ import annotations
 
 import sys
@@ -9,8 +9,8 @@ from app.ui.main_window import MainWindow
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setApplicationName("E01 Indexing Tool")
-    app.setOrganizationName("e01-indexing")
+    app.setApplicationName("E01 Index & Search")
+    app.setOrganizationName("e01-index-search")
 
     win = MainWindow()
     # Default to a size that fits comfortably on a 1366x768 laptop

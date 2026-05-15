@@ -1,14 +1,15 @@
 """Search panel — query the Tantivy indexes belonging to this case.
 
-Improvements over try1.0:
+Features:
 - Live status indicator: 'Working…' while running, exact hit count + ms
   on success, explicit 'No matches' (with hints) on zero results,
   'Error: …' on exception.
 - Smart fallback: when an exact query returns nothing AND the query has
   whitespace, automatically try the spaceless concatenation (e.g.
   "system 32" → "system32") and surface it as a suggestion.
-- TLSH-search mode: optionally search by TLSH distance ('files similar
-  to <hash>') with help text explaining what that means.
+- Multi-mode search: keyword full-text, exact-name substring, SHA-256
+  prefix, TLSH similarity (engine ready, distance search lands when
+  full-corpus TLSH indexing does).
 - Inline 'What is TLSH?' info button.
 """
 from __future__ import annotations
@@ -40,15 +41,16 @@ class SearchPanel(QWidget):
         title.setObjectName("h1")
         root.addWidget(title)
 
-        # IMPORTANT scope banner: try1 indexes file names + paths only.
-        # File contents will be indexed in try2 once Tika / direct
-        # extractors are wired in. Users searching for words inside
-        # documents will silently get 0 results otherwise.
+        # IMPORTANT scope banner: this build indexes file names + paths.
+        # File contents (text inside PDFs, Office docs, raw bytes) will
+        # be indexed in a future release. Users searching for words that
+        # only appear inside a file's body would otherwise get 0 results
+        # with no explanation, so we warn up front.
         scope_banner = QLabel(
-            "<b>Currently indexed:</b> file names + file paths only (per-segment "
-            "metadata from the filesystem walk).  "
-            "<b>Not yet indexed:</b> file contents (text inside PDFs, Office docs, "
-            "raw bytes, etc.) &mdash; that lands in try2. "
+            "<b>Currently indexed:</b> file names and file paths from the "
+            "filesystem walk.  "
+            "<b>Not yet indexed:</b> file contents (text inside PDFs, Office "
+            "documents, raw bytes, etc.) &mdash; that is on the roadmap. "
             "Searching for words that only appear inside a file's body will "
             "return zero hits until then."
         )
@@ -245,7 +247,7 @@ class SearchPanel(QWidget):
                     "segment(s) ({ms:.0f} ms). "
                     "The case has <b>{docs:,}</b> indexed docs so search ran "
                     "fine &mdash; the query just didn't match anything. "
-                    "Remember: try1 indexes file names only, not file "
+                    "Reminder: this build indexes file names only, not file "
                     "contents. Hints: {tips}".format(
                         q=q, n=segments_searched, ms=dt_ms,
                         docs=total_docs, tips="  ".join(tips),

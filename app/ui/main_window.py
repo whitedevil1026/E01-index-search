@@ -80,7 +80,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("E01 Indexing Tool — try1")
+        self.setWindowTitle("E01 Index & Search")
         self.setStyleSheet(STYLE)
         self.case: Case | None = None
 

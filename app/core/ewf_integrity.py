@@ -731,7 +731,7 @@ def format_report_txt(
     out.append(_fmt_kv("Case Identifier", case_id))
     out.append(_fmt_kv("Examiner", examiner))
     out.append(_fmt_kv("Report Generated", now))
-    out.append(_fmt_kv("Tool", "e01-indexing try1 (Python)"))
+    out.append(_fmt_kv("Tool", "E01 Index & Search (Python desktop)"))
     if investigator_notes:
         out.append("")
         out.append("Investigator Notes:")
