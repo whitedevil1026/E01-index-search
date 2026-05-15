@@ -4,6 +4,11 @@ A self-contained desktop forensic indexer for EWF / EnCase E01 images.
 
 Phase 0 + minimal Phase 1 from the May 2026 review document.
 
+Licensed under the **[Apache License 2.0](LICENSE)** — the de-facto
+standard for forensic open-source tooling (Autopsy, Plaso, Volatility,
+pytsk3, TLSH all use it). See [`NOTICE`](NOTICE) for the third-party
+attribution required when redistributing.
+
 ## Quick start (Windows, Python 3.10) — no compiler required
 
 ```

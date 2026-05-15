@@ -1,0 +1,31 @@
+E01 Indexing Tool
+Copyright 2026 whitedevil1026
+
+Licensed under the Apache License, Version 2.0. See LICENSE for the full
+license text.
+
+
+This product bundles pre-built Windows wheels for two third-party
+libraries. Their respective licenses apply to the bundled .whl files in
+the `wheels/` directory:
+
+  * pytsk3 (https://github.com/py4n6/pytsk)
+    Apache License 2.0
+    Copyright (c) Joachim Metz and contributors
+
+  * tlsh — Trend Micro Locality Sensitive Hash (https://github.com/trendmicro/tlsh)
+    Apache License 2.0 OR BSD License
+    Copyright (c) Trend Micro Incorporated
+
+
+This product also depends on (but does not bundle) the following Python
+packages, each licensed by its own authors:
+
+  * PySide6 (LGPL v3 — used only via dynamic linking)
+  * cryptography (Apache 2.0 OR BSD)
+  * tantivy (MIT)
+  * charset-normalizer (MIT)
+  * libewf-python (LGPL v3)
+  * PyMuPDF (AGPL v3 or commercial)
+  * extract-msg (BSD-2-Clause)
+  * YARA-X (BSD)
