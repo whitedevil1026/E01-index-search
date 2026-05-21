@@ -18,6 +18,7 @@ from app.ui.search_panel import SearchPanel
 from app.ui.audit_panel import AuditPanel
 from app.ui.deps_panel import DepsPanel
 from app.ui.integrity_panel import IntegrityPanel
+from app.ui.findings_panel import FindingsPanel
 from app.ui.new_case_dialog import NewCaseDialog
 from app.ui.help_dialog import HelpDialog
 from app.ui.centered_msg import msg_info, msg_warn, msg_error, show_centered
@@ -185,6 +186,7 @@ class MainWindow(QMainWindow):
         self.integrity_panel = IntegrityPanel(self)
         self.ingest_panel = IngestPanel(self)
         self.search_panel = SearchPanel(self)
+        self.findings_panel = FindingsPanel(self)
         self.audit_panel = AuditPanel(self)
         self.deps_panel = DepsPanel(self)
 
@@ -192,6 +194,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.integrity_panel, "Integrity Check")
         self.tabs.addTab(self.ingest_panel, "Ingest")
         self.tabs.addTab(self.search_panel, "Search")
+        self.tabs.addTab(self.findings_panel, "Findings")
         self.tabs.addTab(self.audit_panel, "Audit Log")
         self.tabs.addTab(self.deps_panel, "Deps Status")
 
@@ -300,5 +303,6 @@ class MainWindow(QMainWindow):
         else:
             self.lbl_case.setText("No case loaded — File → New Case or Open Case")
         for panel in (self.case_panel, self.integrity_panel,
-                      self.ingest_panel, self.search_panel, self.audit_panel):
+                      self.ingest_panel, self.search_panel,
+                      self.findings_panel, self.audit_panel):
             panel.set_case(case)

@@ -52,9 +52,10 @@ _RE = {
         rb"(?<![A-Za-z0-9])(?:[13][A-HJ-NP-Za-km-z1-9]{25,34}"
         rb"|bc1[a-z0-9]{11,71})(?![A-Za-z0-9])"),
     # linear — optional +, then a digit-led/ended run of digits and
-    # phone separators; digit-count validation downstream
+    # phone separators. Dots are deliberately excluded: version strings
+    # like 6.1.7600.16385 would otherwise match. Validation downstream.
     "phone": re.compile(
-        rb"(?<![\dA-Za-z+])\+?\d[\d \-.()]{6,16}\d(?![\dA-Za-z])"),
+        rb"(?<![\dA-Za-z+.])\+?\d[\d \-()]{6,16}\d(?![\dA-Za-z.])"),
     "mac": re.compile(
         rb"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}"
         rb"(?![0-9A-Fa-f:])"),
@@ -110,7 +111,16 @@ def _luhn_ok(digits: str) -> bool:
 
 def _plausible_phone(value: str) -> bool:
     digits = re.sub(r"\D", "", value)
-    return 7 <= len(digits) <= 15
+    if not (7 <= len(digits) <= 15):
+        return False
+    # reject all-identical digit runs (00000000, 11111111, …)
+    if len(set(digits)) <= 1:
+        return False
+    # reject leading-zero runs (0000xxxx) — binary integer padding,
+    # not a phone number
+    if digits.startswith("0000"):
+        return False
+    return True
 
 
 # ---- scanning -------------------------------------------------------------

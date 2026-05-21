@@ -45,6 +45,8 @@ class IngestPanel(QWidget):
         # Credentials collected by Scan Volumes for any encrypted volume.
         self._credentials = None
         self._scanned_volumes: list = []
+        # Examiner-supplied YARA rule files (compiled alongside built-ins).
+        self._yara_rule_files: list = []
 
         # Whole panel is scrollable so the user can always reach the
         # bottom log even on a small window. Cap the scroll-area's own
@@ -329,16 +331,34 @@ class IngestPanel(QWidget):
             "attachments, data in unallocated space."
         )
         self.chk_yara = QCheckBox(
-            "YARA-X scan — flag files matching the built-in IoC rule pack"
+            "YARA-X scan — flag files matching the IoC rule pack"
         )
         self.chk_yara.setToolTip(
             "Runs the built-in YARA-X rules (private keys, AWS keys, "
             "executables, wallet artefacts, saved browser passwords) over "
-            "carved files and extracted documents."
+            "carved files. Load your own .yar rules with the button on "
+            "the right to scan against them too."
         )
         for cb in (self.chk_raw_strings, self.chk_raw_patterns,
-                   self.chk_carve, self.chk_yara):
+                   self.chk_carve):
             rl.addWidget(cb)
+        # YARA row — checkbox + custom-rule loader
+        yara_row = QHBoxLayout()
+        yara_row.addWidget(self.chk_yara)
+        yara_row.addSpacing(16)
+        btn_yara_rules = QPushButton("Load custom .yar rules…")
+        btn_yara_rules.setObjectName("secondary")
+        btn_yara_rules.clicked.connect(self._load_yara_rules)
+        btn_yara_rules.setToolTip(
+            "Add your own YARA rule files. They are compiled alongside the "
+            "built-in pack for this case."
+        )
+        yara_row.addWidget(btn_yara_rules)
+        self.lbl_yara_rules = QLabel("built-in pack only")
+        self.lbl_yara_rules.setObjectName("muted")
+        yara_row.addWidget(self.lbl_yara_rules)
+        yara_row.addStretch(1)
+        rl.addLayout(yara_row)
         ol.addWidget(raw_box)
 
         run_row = QHBoxLayout()
@@ -448,6 +468,27 @@ class IngestPanel(QWidget):
 
     def _on_vss_toggled(self, checked: bool):
         self.chk_vss_dedup.setEnabled(checked)
+
+    def _load_yara_rules(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select YARA rule files", str(Path.home()),
+            "YARA rules (*.yar *.yara);;All files (*.*)",
+        )
+        if not paths:
+            return
+        # validate they compile before accepting
+        if YaraScanner is not None:
+            try:
+                YaraScanner.from_files(paths, include_builtin=True)
+            except Exception as exc:  # noqa: BLE001
+                msg_error(self, "Rule compile error",
+                          f"The selected rules did not compile:\n\n{exc}")
+                return
+        self._yara_rule_files = list(paths)
+        self.lbl_yara_rules.setText(
+            f"built-in pack + {len(paths)} custom file(s)")
+        self.chk_yara.setChecked(True)
+        self._append_log(f"loaded {len(paths)} custom YARA rule file(s)")
 
     def _scan_volumes(self):
         """Enumerate volumes, probe encryption + VSS, and collect keys
@@ -726,12 +767,24 @@ class IngestPanel(QWidget):
         yara_scanner = None
         if do_yara and YaraScanner is not None:
             try:
-                yara_scanner = YaraScanner()
-                w.log.emit("  YARA-X built-in rule pack loaded")
+                if self._yara_rule_files:
+                    yara_scanner = YaraScanner.from_files(
+                        self._yara_rule_files, include_builtin=True)
+                    w.log.emit(f"  YARA-X: built-in pack + "
+                               f"{len(self._yara_rule_files)} custom file(s)")
+                else:
+                    yara_scanner = YaraScanner()
+                    w.log.emit("  YARA-X built-in rule pack loaded")
             except Exception as exc:  # noqa: BLE001
                 w.log.emit(f"  [warn] YARA init failed: {exc}")
 
         # ---- raw strings + IoC patterns (paged sweep) -----------------
+        # Distinct IoC indicators, deduplicated across the whole image:
+        #   (kind, value) -> [occurrence_count, first_offset]
+        # Capped so a pathological image cannot exhaust memory.
+        IOC_DISTINCT_CAP = 500_000
+        ioc_distinct: dict = {}
+
         if do_raw_strings or do_raw_patterns:
             counters = {"raw_docs": 0, "pat": 0}
             pat_totals: dict = {}
@@ -751,6 +804,12 @@ class IngestPanel(QWidget):
                         counters["pat"] += len(phits)
                         for ph in phits:
                             pat_totals[ph.kind] = pat_totals.get(ph.kind, 0) + 1
+                            key = (ph.kind, ph.value)
+                            slot = ioc_distinct.get(key)
+                            if slot is not None:
+                                slot[0] += 1
+                            elif len(ioc_distinct) < IOC_DISTINCT_CAP:
+                                ioc_distinct[key] = [1, page.offset]
                         body_parts.append("\n".join(
                             f"{p.kind}: {p.value}" for p in phits))
                 if body_parts and writer is not None and indexer is not None:
@@ -786,6 +845,17 @@ class IngestPanel(QWidget):
                     summary["patterns"] = counters["pat"]
                     case.log("ingest.raw_patterns",
                              {"total": counters["pat"], "by_kind": pat_totals})
+                    # persist distinct indicators to the findings table
+                    if ioc_distinct:
+                        finding_rows = [
+                            {"kind": "ioc", "subtype": k[0], "value": k[1],
+                             "count": v[0], "first_offset": v[1]}
+                            for k, v in ioc_distinct.items()
+                        ]
+                        case.add_findings(ev_id, finding_rows)
+                        w.log.emit(f"  stored {len(finding_rows):,} distinct "
+                                   f"IoC indicators to findings")
+                        summary["distinct_iocs"] = len(finding_rows)
             except Exception as exc:  # noqa: BLE001
                 w.log.emit(f"  [error] raw sweep failed: {exc}")
 
@@ -795,6 +865,8 @@ class IngestPanel(QWidget):
             carved_rows: list = []
             counts = {"carved": 0, "yara": 0}
             yara_by_rule: dict = {}
+            # distinct YARA matches: (rule, source) -> count
+            yara_distinct: dict = {}
 
             def on_carved(cf):
                 if w.cancelled:
@@ -808,6 +880,8 @@ class IngestPanel(QWidget):
                         counts["yara"] += 1
                         yara_by_rule[m.rule] = yara_by_rule.get(m.rule, 0) + 1
                         yara_tags.append(m.rule)
+                        yk = (m.rule, m.source)
+                        yara_distinct[yk] = yara_distinct.get(yk, 0) + 1
                 row = {
                     "inode": None,
                     "path": f"/(carved)/{cf.file_type}/{cf.offset:#x}",
@@ -855,6 +929,14 @@ class IngestPanel(QWidget):
                     summary["yara"] = counts["yara"]
                     case.log("ingest.yara", {"matches": counts["yara"],
                                              "by_rule": yara_by_rule})
+                    # persist YARA matches to the findings table
+                    if yara_distinct:
+                        yrows = [
+                            {"kind": "yara", "subtype": rule, "value": src,
+                             "count": cnt, "first_offset": None}
+                            for (rule, src), cnt in yara_distinct.items()
+                        ]
+                        case.add_findings(ev_id, yrows)
             except Exception as exc:  # noqa: BLE001
                 w.log.emit(f"  [error] carving failed: {exc}")
 

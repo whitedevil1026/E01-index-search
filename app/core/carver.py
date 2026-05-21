@@ -98,16 +98,28 @@ def _carve_one(blob: bytes, start: int, abs_start: int, sig: _Sig,
 
     Returns None (skip) when the end cannot be reliably determined.
     """
-    # ---- length-based (BMP): read just the 6-byte header first -------
+    # ---- length-based (BMP): validate the 18-byte header -------------
     if sig.length_based:
-        hdr = blob[start:start + 6]
-        if len(hdr) < 6:
-            hdr = hdr + read_more(abs_start + len(hdr), 6 - len(hdr))
-        if len(hdr) < 6:
+        hdr = blob[start:start + 18]
+        if len(hdr) < 18:
+            hdr = hdr + read_more(abs_start + len(hdr), 18 - len(hdr))
+        if len(hdr) < 18:
             return None
         try:
             size = struct.unpack_from("<I", hdr, 2)[0]
+            reserved = struct.unpack_from("<I", hdr, 6)[0]
+            data_offset = struct.unpack_from("<I", hdr, 10)[0]
+            dib_size = struct.unpack_from("<I", hdr, 14)[0]
         except Exception:  # noqa: BLE001
+            return None
+        # A real BMP: reserved == 0, the DIB header size is one of the
+        # standard values, and the pixel-data offset is small. These
+        # checks reject the bulk of `BM`-coincidence false positives.
+        if reserved != 0:
+            return None
+        if dib_size not in (12, 40, 52, 56, 64, 108, 124):
+            return None
+        if not (26 <= data_offset <= 4096):
             return None
         if not (MIN_CARVE_SIZE <= size <= sig.max_size):
             return None

@@ -88,6 +88,22 @@ CREATE TABLE IF NOT EXISTS case_config (
     key TEXT PRIMARY KEY,
     value_json TEXT NOT NULL
 );
+
+-- Raw-scan findings: distinct IoC indicators and YARA matches.
+-- IoC rows are deduplicated per (kind, subtype, value) with an
+-- occurrence count; YARA rows are per (rule, source).
+CREATE TABLE IF NOT EXISTS findings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    evidence_id INTEGER NOT NULL REFERENCES evidence(id),
+    kind TEXT NOT NULL,          -- 'ioc' | 'yara'
+    subtype TEXT NOT NULL,       -- ioc: email/url/...  yara: rule name
+    value TEXT NOT NULL,         -- the indicator value / matched source
+    count INTEGER NOT NULL DEFAULT 1,
+    first_offset INTEGER,
+    added_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_findings_ev ON findings(evidence_id);
+CREATE INDEX IF NOT EXISTS idx_findings_kind ON findings(kind, subtype);
 """
 
 SCHEMA_VERSION = 1
@@ -249,6 +265,85 @@ class Case:
                 n += 1
             conn.execute("COMMIT")
         return n
+
+    # ---- findings (raw-scan IoC / YARA) ----------------------------------
+
+    def add_findings(self, evidence_id: int, rows: Iterable[dict]) -> int:
+        """Bulk-insert raw-scan findings. Each row dict needs:
+        kind, subtype, value, and optionally count / first_offset.
+        """
+        n = 0
+        now = time.time()
+        with self.connect() as conn:
+            conn.execute("BEGIN")
+            for r in rows:
+                conn.execute(
+                    "INSERT INTO findings(evidence_id, kind, subtype, value, "
+                    "count, first_offset, added_at) VALUES (?,?,?,?,?,?,?)",
+                    (evidence_id, r["kind"], r["subtype"], r["value"],
+                     int(r.get("count", 1)), r.get("first_offset"), now),
+                )
+                n += 1
+            conn.execute("COMMIT")
+        return n
+
+    def list_findings(self, kind: str | None = None,
+                      subtype: str | None = None,
+                      search: str | None = None,
+                      limit: int = 2000) -> list[dict]:
+        q = ("SELECT id, evidence_id, kind, subtype, value, count, "
+             "first_offset, added_at FROM findings")
+        clauses: list[str] = []
+        params: list[Any] = []
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if subtype:
+            clauses.append("subtype = ?")
+            params.append(subtype)
+        if search:
+            clauses.append("value LIKE ?")
+            params.append(f"%{search}%")
+        if clauses:
+            q += " WHERE " + " AND ".join(clauses)
+        q += " ORDER BY count DESC, id ASC LIMIT ?"
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(q, params).fetchall()
+        cols = ["id", "evidence_id", "kind", "subtype", "value", "count",
+                "first_offset", "added_at"]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def findings_summary(self) -> dict[str, dict[str, int]]:
+        """Return {kind: {subtype: total_count}} across the case."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT kind, subtype, SUM(count) FROM findings "
+                "GROUP BY kind, subtype"
+            ).fetchall()
+        out: dict[str, dict[str, int]] = {}
+        for kind, subtype, total in rows:
+            out.setdefault(kind, {})[subtype] = int(total or 0)
+        return out
+
+    def carved_files(self, search: str | None = None,
+                     limit: int = 2000) -> list[dict]:
+        """Carved files are recorded in the files table with a
+        /(carved)/ path prefix — surface them for the Findings view.
+        """
+        q = ("SELECT id, evidence_id, path, name, size_bytes, md5, sha256, "
+             "tlsh FROM files WHERE path LIKE '/(carved)/%'")
+        params: list[Any] = []
+        if search:
+            q += " AND (name LIKE ? OR sha256 LIKE ?)"
+            params += [f"%{search}%", f"%{search}%"]
+        q += " ORDER BY size_bytes DESC LIMIT ?"
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(q, params).fetchall()
+        cols = ["id", "evidence_id", "path", "name", "size_bytes",
+                "md5", "sha256", "tlsh"]
+        return [dict(zip(cols, r)) for r in rows]
 
     # ---- audit log -------------------------------------------------------
 
