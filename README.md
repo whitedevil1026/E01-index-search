@@ -144,21 +144,32 @@ py -3.13 tools/build_wheels.py
 Commit the resulting `.whl` files in `wheels/`. The in-app installer
 picks them up automatically.
 
+## Implemented
+
+- **Image access** — E01 read, partition enumeration, parallel
+  multi-handle media hashing, TSK + direct-libfsntfs/libfsapfs walking
+- **Encryption** — BitLocker, FileVault 2 and LUKS detection and
+  key-escrow unlock (recovery key / password / startup key / FVEK)
+- **VSS** — Volume Shadow Copy snapshot enumeration and walking, with
+  cross-snapshot file deduplication
+- **Content indexing** — text extraction from PDF, DOCX/XLSX/PPTX,
+  MSG, EML, HTML, RTF and plain-text files (pure-Python, no Tika)
+- **Integrity** — EWF segment verification + FTK-style reporting
+- **Court-defensibility** — hash-chained audit log, Ed25519 manifest
+
 ## What's not yet implemented
 
 The following features are designed in the architecture but not yet
 wired in. Each is a discrete chunk of future work:
 
-- **File-content indexing** — Apache Tika / PyMuPDF / extract-msg /
-  libpff routing so search hits text inside PDFs, Office docs, emails
 - **bulk_extractor 2.1.1** — raw-stream scan for emails, URLs,
   credit-card numbers, JSON fragments in unallocated space
 - **YARA-X rule pack runner** — IoC scanning against carved files
 - **TLSH similarity search** — UI button to find files near a chosen
   TLSH hash; engine is already in place
 - **NSRL RDS hash filter** — drop known-good files before indexing
-- **VSS snapshot chunk-level deduplication**
-- **BitLocker / FileVault / LUKS key-escrow workflow**
+- **Specialized artifact parsers** — PST/OST, registry hives, ESE,
+  chat-app databases
 - **Multi-image case stitching** (one case spanning many evidence sets)
 - **AFF4 read support** via `pyaff4`
 
@@ -170,10 +181,13 @@ wired in. Each is a discrete chunk of future work:
 - **Crypto / signing**: cryptography ≥ 42 (Ed25519, FIPS-capable)
 - **Search index**: tantivy-py ≥ 0.22, < 0.26
 - **E01 reader**: libewf-python 20240506
-- **Filesystem**: The Sleuth Kit via pytsk3 ≥ 20230125
+- **Filesystem**: The Sleuth Kit via pytsk3, plus direct libfsntfs /
+  libfsapfs
+- **Encryption**: libbde (BitLocker), libfvde (FileVault), libluksde (LUKS)
+- **VSS**: libvshadow
+- **Content extraction**: PyMuPDF + extract-msg + Python stdlib
 - **Fuzzy hash**: python-tlsh ≥ 4.5
-- **Optional / future**: PyMuPDF, extract-msg, YARA-X, libpff,
-  libesedb, libregf, libvshadow, libbde / libfvde / libluksde
+- **Optional / future**: YARA-X, libpff, libesedb, libregf
 
 ## Development notes
 

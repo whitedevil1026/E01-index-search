@@ -13,14 +13,18 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from app.core.ewf_reader import inspect, glob_segments, EwfHandle, HAS_PYEWF
-from app.core.filesystem import walk_image, HAS_PYTSK3
+from app.core.ewf_reader import (
+    inspect, glob_segments, EwfHandle, parallel_hash, HAS_PYEWF,
+)
+from app.core.filesystem import walk_image, scan_volumes, HAS_PYTSK3
 from app.core.hashing import hash_stream
 from app.core.hash_policy import HashPolicy
 from app.core.indexer import HAS_TANTIVY, Indexer
 from app.core.text_extract import extract_text, MAX_TEXT_CHARS
 from app.core.worker import Worker
-from app.ui.centered_msg import msg_error, msg_info, msg_question, msg_warn
+from app.core import encryption as enc_mod
+from app.ui.centered_msg import msg_error, msg_info, msg_question, msg_warn, show_centered
+from app.ui.encryption_dialog import EncryptionKeyDialog
 from app.ui.integrity_panel import quick_pre_flight
 
 
@@ -29,6 +33,9 @@ class IngestPanel(QWidget):
         super().__init__(parent)
         self.case = None
         self._worker: Worker | None = None
+        # Credentials collected by Scan Volumes for any encrypted volume.
+        self._credentials = None
+        self._scanned_volumes: list = []
 
         # Whole panel is scrollable so the user can always reach the
         # bottom log even on a small window. Cap the scroll-area's own
@@ -81,10 +88,20 @@ class IngestPanel(QWidget):
         btn_integrity.setToolTip(
             "Verify the segment set is complete and not corrupted before ingest."
         )
+        btn_scan = QPushButton("Scan Volumes")
+        btn_scan.setObjectName("secondary")
+        btn_scan.clicked.connect(self._scan_volumes)
+        btn_scan.setToolTip(
+            "Enumerate the partitions inside the image and probe each for "
+            "BitLocker / FileVault / LUKS encryption and Volume Shadow "
+            "Copies. If an encrypted volume is found you'll be prompted "
+            "for the key."
+        )
         pl.addWidget(self.path_edit, 1)
         pl.addWidget(btn_browse)
         pl.addWidget(btn_inspect)
         pl.addWidget(btn_integrity)
+        pl.addWidget(btn_scan)
         root.addWidget(pick)
 
         # ---- 2a: image info (header-only, no I/O over the whole file) -
@@ -247,6 +264,31 @@ class IngestPanel(QWidget):
         content_note.setWordWrap(True)
         ol.addWidget(content_note)
 
+        # VSS (Volume Shadow Copy) row
+        vss_row = QHBoxLayout()
+        self.chk_vss = QCheckBox("Include Volume Shadow Copies (VSS snapshots)")
+        self.chk_vss.setToolTip(
+            "Also walk every Volume Shadow Copy on each volume. Shadow "
+            "copies are point-in-time snapshots that often still contain "
+            "files the user later deleted — a major evidence source."
+        )
+        self.chk_vss.toggled.connect(self._on_vss_toggled)
+        self.chk_vss_dedup = QCheckBox(
+            "Deduplicate files identical across snapshots"
+        )
+        self.chk_vss_dedup.setChecked(True)
+        self.chk_vss_dedup.setEnabled(False)
+        self.chk_vss_dedup.setToolTip(
+            "Most files are byte-identical across snapshots. With dedup on, "
+            "a file already seen (same path + size + mtime) in another "
+            "snapshot is skipped, keeping the index 10-30x smaller."
+        )
+        vss_row.addWidget(self.chk_vss)
+        vss_row.addSpacing(16)
+        vss_row.addWidget(self.chk_vss_dedup)
+        vss_row.addStretch(1)
+        ol.addLayout(vss_row)
+
         run_row = QHBoxLayout()
         self.btn_run = QPushButton("Ingest into Case")
         self.btn_run.setToolTip(
@@ -352,6 +394,68 @@ class IngestPanel(QWidget):
     def _on_content_toggled(self, checked: bool):
         self.spin_content_mb.setEnabled(checked)
 
+    def _on_vss_toggled(self, checked: bool):
+        self.chk_vss_dedup.setEnabled(checked)
+
+    def _scan_volumes(self):
+        """Enumerate volumes, probe encryption + VSS, and collect keys
+        for any encrypted volume found. Runs synchronously — it only
+        reads partition + signature headers, so it is fast.
+        """
+        if not self._segs:
+            msg_warn(self, "Inspect first",
+                     "Pick an E01 file and click Inspect before scanning volumes.")
+            return
+        self._append_log("Scanning volumes…")
+        try:
+            with EwfHandle(self._segs) as h:
+                vols = scan_volumes(h)
+        except Exception as exc:  # noqa: BLE001
+            msg_error(self, "Scan failed", f"{type(exc).__name__}: {exc}")
+            return
+        self._scanned_volumes = vols
+        self._credentials = None
+        enc_found = []
+        for v in vols:
+            enc = enc_mod.human_name(v.encryption) if v.encryption else "none"
+            vss = "yes" if v.has_vss else "no"
+            self._append_log(
+                f"  vol{v.index}: {v.length:,} bytes  encryption={enc}  "
+                f"VSS={vss}  {v.description}"
+            )
+            if v.encryption:
+                enc_found.append(v)
+
+        if not enc_found:
+            self._append_log("  no encrypted volumes — ingest can proceed directly")
+            msg_info(self, "Volume scan complete",
+                     f"{len(vols)} volume(s) found, none encrypted.\n"
+                     "VSS snapshots, if any, are shown in the log.")
+            return
+
+        # collect credentials for the encrypted volume(s)
+        for v in enc_found:
+            dlg = EncryptionKeyDialog(self, kind=v.encryption,
+                                      volume_label=f"vol{v.index}")
+            show_centered(dlg, self)
+            if dlg.result_skip():
+                self._append_log(f"  vol{v.index}: examiner chose to skip")
+                continue
+            creds = dlg.credentials()
+            if not creds.is_empty():
+                self._credentials = creds
+                self._append_log(
+                    f"  vol{v.index}: key material captured for "
+                    f"{enc_mod.human_name(v.encryption)}"
+                )
+                # try1: a single credential set is applied to every
+                # encrypted volume during the ingest walk.
+                break
+        if self._credentials is None:
+            msg_warn(self, "No keys captured",
+                     "No key material was entered. Encrypted volumes will be "
+                     "tagged 'encrypted, no usable text' during ingest.")
+
     def _clear_comp_results(self):
         while self.comp_form.rowCount() > 0:
             self.comp_form.removeRow(0)
@@ -403,37 +507,38 @@ class IngestPanel(QWidget):
         self.lbl_comp_status.setStyleSheet("color:#facc15;")
 
         segs = list(self._segs)
-        total_bytes = sum(Path(p).stat().st_size for p in segs)
+        n_workers = 4
+        media_size_holder = {"size": 0}
 
         def task(w: Worker) -> tuple[bool, str]:
-            # Single pass per segment, accumulate across segments per algo
-            from app.core.hash_policy import _new_hasher
-            hashers = {a: _new_hasher(a) for a in policy.all_algos()}
-            done = 0
+            # Hash the decompressed MEDIA CONTENT (the imaged disk), using
+            # multiple libewf handles in parallel. This is the value that
+            # is directly comparable to the acquisition hash recorded in
+            # the E01 header — the gold-standard image-verification check.
+            w.log.emit(f"Parallel media hash — {n_workers} libewf handles")
             t0 = time.time()
-            for seg in segs:
-                w.log.emit(f"hashing segment: {Path(seg).name}")
-                with open(seg, "rb") as fh:
-                    while True:
-                        if w.cancelled:
-                            return False, "cancelled by user"
-                        chunk = fh.read(1 << 20)
-                        if not chunk:
-                            break
-                        done += len(chunk)
-                        for h in hashers.values():
-                            h.update(chunk)
-                        w.progress.emit(done, total_bytes, "")
+            try:
+                result = parallel_hash(
+                    segs, list(policy.all_algos()),
+                    n_workers=n_workers, block_size=16 * 1024 * 1024,
+                    progress_cb=lambda d, t: w.progress.emit(d, t, ""),
+                    cancel_cb=lambda: w.cancelled,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if w.cancelled:
+                    return False, "cancelled by user"
+                raise
             elapsed = time.time() - t0
-            mb_s = (total_bytes / 1024 / 1024) / max(elapsed, 0.001)
-            for algo, h in hashers.items():
-                hex_digest = h.hexdigest()
-                # back to UI thread via signal — but Worker uses
-                # a single 'log' signal so we encode the value
+            size = int(result.pop("size_bytes", 0))
+            media_size_holder["size"] = size
+            mb_s = (size / 1024 / 1024) / max(elapsed, 0.001)
+            for algo, hex_digest in result.items():
+                # Worker exposes a single 'log' signal, so encode the
+                # per-algorithm result and decode it in on_log().
                 w.log.emit(f"@HASH@{algo}={hex_digest}")
             return True, (
-                f"computed {len(hashers)} hashes over "
-                f"{total_bytes:,} bytes in {elapsed:.1f}s ({mb_s:.0f} MB/s)"
+                f"computed {len(result)} media-content hash(es) over "
+                f"{size:,} bytes in {elapsed:.1f}s ({mb_s:.0f} MB/s)"
             )
 
         w = Worker(task, self)
@@ -465,9 +570,10 @@ class IngestPanel(QWidget):
                 if self.case:
                     self.case.log("ingest.hash_compute", {
                         "segments": [Path(p).name for p in segs],
-                        "total_bytes": total_bytes,
+                        "media_bytes": media_size_holder["size"],
                         "algos": list(policy.all_algos()),
                         "primary": policy.primary,
+                        "method": f"parallel_hash x{n_workers}",
                     })
                 mw = self.window()
                 if hasattr(mw, "audit_panel"):
@@ -589,6 +695,9 @@ class IngestPanel(QWidget):
         do_index = self.chk_index.isChecked() and HAS_TANTIVY
         do_content = self.chk_content.isChecked() and HAS_TANTIVY
         max_content_bytes = self.spin_content_mb.value() * 1024 * 1024
+        do_vss = self.chk_vss.isChecked()
+        do_vss_dedup = self.chk_vss_dedup.isChecked()
+        credentials = self._credentials
         # Content mode buffers up to ~1 MB of text per doc in the Tantivy
         # writer, so commit more often and give the writer a bigger heap.
         commit_every = 2000 if do_content else 5000
@@ -600,6 +709,10 @@ class IngestPanel(QWidget):
             w.log.emit(f"Registering evidence: {first}")
             if do_content:
                 w.log.emit(f"Content extraction ON (max {max_content_bytes // (1024*1024)} MB/file)")
+            if do_vss:
+                w.log.emit(f"VSS snapshots ON (dedup={'on' if do_vss_dedup else 'off'})")
+            if credentials is not None:
+                w.log.emit("Encryption keys loaded — encrypted volumes will be unlocked")
             ev_id = case.add_evidence(
                 path=first, fmt=info.format, size=info.media_size,
                 md5=info.md5, sha256=None,
@@ -636,6 +749,10 @@ class IngestPanel(QWidget):
                     h, max_files=max_files,
                     read_content=do_content,
                     max_content_bytes=max_content_bytes,
+                    credentials=credentials,
+                    include_vss=do_vss,
+                    vss_dedup=do_vss_dedup,
+                    log=lambda m: w.log.emit(m),
                 )
                 buf: list[dict] = []   # SQLite metadata batch (no file text)
                 t0 = time.time()
@@ -661,6 +778,7 @@ class IngestPanel(QWidget):
                         "ctime": rec.ctime, "crtime": rec.crtime,
                         "is_allocated": rec.is_allocated,
                         "ads_name": rec.ads_name,
+                        "vss_snapshot_id": rec.vss_snapshot_id,
                         "md5": None, "sha256": None, "tlsh": None,
                     }
                     buf.append(row)

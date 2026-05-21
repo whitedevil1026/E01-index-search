@@ -19,8 +19,19 @@ python-tlsh>=4.5             # actively maintained; ssdeep optional/secondary
 libewf-python==20240506      # E01 reader; status: pre-alpha but de-facto standard
 pytsk3>=20230125             # Sleuth Kit binding
 
-# Optional (Phase 2+, not required for try1 to run):
-# pymupdf>=1.24
-# extract-msg>=0.50
-# libpff-python
+# Phase 1 — image-access stack (all ship prebuilt cp310 Windows wheels,
+# also bundled in ./wheels/ for offline install).
+libvshadow-python>=20240504  # Volume Shadow Copy (VSS) snapshots
+libbde-python>=20240502      # BitLocker decryption
+libfvde-python>=20240502     # FileVault 2 decryption
+libluksde-python>=20240503   # LUKS decryption
+libfsntfs-python>=20240501   # direct NTFS (TSK fallback)
+libfsapfs-python>=20240429   # direct APFS (TSK fallback)
+
+# Phase 2 — content extraction (PyMuPDF + extract-msg; the rest is stdlib)
+pymupdf>=1.24                # PDF text extraction
+extract-msg>=0.50            # Outlook .msg parsing
+
+# Optional (later phases):
 # yara-x>=1.0
+# libpff-python
