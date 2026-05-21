@@ -154,6 +154,11 @@ picks them up automatically.
   cross-snapshot file deduplication
 - **Content indexing** — text extraction from PDF, DOCX/XLSX/PPTX,
   MSG, EML, HTML, RTF and plain-text files (pure-Python, no Tika)
+- **Raw scan** — paged multi-encoding string sweep over unallocated
+  space and slack (ASCII / UTF-8 / UTF-16 / CJK), IoC pattern
+  extraction (emails, URLs, IPs, Luhn-checked cards, crypto
+  addresses, phones), file-signature carving (JPEG/PNG/GIF/PDF/BMP)
+  and YARA-X scanning of carved files
 - **Integrity** — EWF segment verification + FTK-style reporting
 - **Court-defensibility** — hash-chained audit log, Ed25519 manifest
 
@@ -162,12 +167,11 @@ picks them up automatically.
 The following features are designed in the architecture but not yet
 wired in. Each is a discrete chunk of future work:
 
-- **bulk_extractor 2.1.1** — raw-stream scan for emails, URLs,
-  credit-card numbers, JSON fragments in unallocated space
-- **YARA-X rule pack runner** — IoC scanning against carved files
 - **TLSH similarity search** — UI button to find files near a chosen
   TLSH hash; engine is already in place
 - **NSRL RDS hash filter** — drop known-good files before indexing
+- **Custom YARA rule loading** — load examiner `.yar` files alongside
+  the built-in pack
 - **Specialized artifact parsers** — PST/OST, registry hives, ESE,
   chat-app databases
 - **Multi-image case stitching** (one case spanning many evidence sets)

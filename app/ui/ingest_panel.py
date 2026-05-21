@@ -23,6 +23,15 @@ from app.core.indexer import HAS_TANTIVY, Indexer
 from app.core.text_extract import extract_text, MAX_TEXT_CHARS
 from app.core.worker import Worker
 from app.core import encryption as enc_mod
+from app.core.raw_scan import raw_string_sweep
+from app.core import patterns as pat_mod
+from app.core.carver import carve_stream
+from app.core.hashing import hash_bytes
+try:
+    from app.core.yara_scan import YaraScanner, HAS_YARA_X
+except Exception:  # noqa: BLE001
+    YaraScanner = None
+    HAS_YARA_X = False
 from app.ui.centered_msg import msg_error, msg_info, msg_question, msg_warn, show_centered
 from app.ui.encryption_dialog import EncryptionKeyDialog
 from app.ui.integrity_panel import quick_pre_flight
@@ -288,6 +297,49 @@ class IngestPanel(QWidget):
         vss_row.addWidget(self.chk_vss_dedup)
         vss_row.addStretch(1)
         ol.addLayout(vss_row)
+
+        # Raw-scan options — operate on raw image bytes, after the FS walk
+        raw_box = QGroupBox("Raw scan — unallocated space, carving & IoCs "
+                            "(slow; reads the whole image)")
+        rl = QVBoxLayout(raw_box)
+        self.chk_raw_strings = QCheckBox(
+            "Raw strings sweep — index text from unallocated space & slack "
+            "in all encodings (ASCII / UTF-8 / UTF-16 / CJK)"
+        )
+        self.chk_raw_strings.setToolTip(
+            "Reads the entire image in 16 MiB pages and extracts printable "
+            "strings under every encoding. Surfaces deleted documents, chat "
+            "fragments and registry remnants the filesystem walk never sees."
+        )
+        self.chk_raw_patterns = QCheckBox(
+            "IoC pattern extraction — emails, URLs, IPs, credit cards, "
+            "crypto addresses, phone numbers"
+        )
+        self.chk_raw_patterns.setToolTip(
+            "Regex-scan raw bytes for high-value indicators. Credit-card "
+            "numbers are Luhn-validated to cut false positives."
+        )
+        self.chk_carve = QCheckBox(
+            "File carving — recover deleted / embedded files by signature "
+            "(JPEG, PNG, PDF, ZIP, Office, …)"
+        )
+        self.chk_carve.setToolTip(
+            "Scans for file magic signatures and carves out files that the "
+            "filesystem no longer references — deleted files, embedded "
+            "attachments, data in unallocated space."
+        )
+        self.chk_yara = QCheckBox(
+            "YARA-X scan — flag files matching the built-in IoC rule pack"
+        )
+        self.chk_yara.setToolTip(
+            "Runs the built-in YARA-X rules (private keys, AWS keys, "
+            "executables, wallet artefacts, saved browser passwords) over "
+            "carved files and extracted documents."
+        )
+        for cb in (self.chk_raw_strings, self.chk_raw_patterns,
+                   self.chk_carve, self.chk_yara):
+            rl.addWidget(cb)
+        ol.addWidget(raw_box)
 
         run_row = QHBoxLayout()
         self.btn_run = QPushButton("Ingest into Case")
@@ -661,6 +713,153 @@ class IngestPanel(QWidget):
         # Wipe any previous compute results — they were for a different image.
         self._clear_comp_results()
 
+    # ---- raw-scan pass (Phase 2 strings + Phase 3 carving/IoC/YARA) -----
+
+    def _raw_scan_pass(self, w, case, ev_id, evidence_uuid, segs,
+                       indexer, writer, do_raw_strings, do_raw_patterns,
+                       do_carve, do_yara) -> dict:
+        """Run the raw byte-level scans after the filesystem walk.
+        Returns a summary dict. Runs inside the ingest Worker thread.
+        """
+        summary: dict = {}
+
+        yara_scanner = None
+        if do_yara and YaraScanner is not None:
+            try:
+                yara_scanner = YaraScanner()
+                w.log.emit("  YARA-X built-in rule pack loaded")
+            except Exception as exc:  # noqa: BLE001
+                w.log.emit(f"  [warn] YARA init failed: {exc}")
+
+        # ---- raw strings + IoC patterns (paged sweep) -----------------
+        if do_raw_strings or do_raw_patterns:
+            counters = {"raw_docs": 0, "pat": 0}
+            pat_totals: dict = {}
+
+            def on_page(page, text, n_strings):
+                if w.cancelled:
+                    return
+                body_parts = []
+                if do_raw_strings and text:
+                    body_parts.append(text)
+                if do_raw_patterns and text:
+                    # Patterns are scanned over the *extracted text*, not
+                    # the raw bytes — ~10x less data and no regex
+                    # backtracking on binary noise.
+                    phits = pat_mod.scan_text(text)
+                    if phits:
+                        counters["pat"] += len(phits)
+                        for ph in phits:
+                            pat_totals[ph.kind] = pat_totals.get(ph.kind, 0) + 1
+                        body_parts.append("\n".join(
+                            f"{p.kind}: {p.value}" for p in phits))
+                if body_parts and writer is not None and indexer is not None:
+                    indexer.add_doc(
+                        writer,
+                        case_doc_id=hash((ev_id, "raw", page.offset))
+                        & 0x7FFFFFFFFFFFFFFF,
+                        path=f"/(raw)/{page.offset:#x}",
+                        name=f"raw@{page.offset:#x}",
+                        body="\n".join(body_parts),
+                        encoding="multi", size_bytes=page.length,
+                        sha256="", tlsh="", evidence_uuid=evidence_uuid,
+                    )
+                    counters["raw_docs"] += 1
+
+            try:
+                with EwfHandle(segs) as rh:
+                    stats = raw_string_sweep(
+                        rh, on_page=on_page,
+                        progress_cb=lambda d, t: w.progress.emit(d, t, ""),
+                        cancel_cb=lambda: w.cancelled,
+                    )
+                w.log.emit(
+                    f"  raw sweep: {stats.pages} pages, "
+                    f"{stats.bytes_scanned:,} bytes, {stats.strings:,} "
+                    f"strings -> {counters['raw_docs']} indexed docs"
+                )
+                summary["raw_docs"] = counters["raw_docs"]
+                if do_raw_patterns:
+                    top = dict(sorted(pat_totals.items(),
+                                      key=lambda kv: -kv[1]))
+                    w.log.emit(f"  IoC patterns: {counters['pat']:,} hits  {top}")
+                    summary["patterns"] = counters["pat"]
+                    case.log("ingest.raw_patterns",
+                             {"total": counters["pat"], "by_kind": pat_totals})
+            except Exception as exc:  # noqa: BLE001
+                w.log.emit(f"  [error] raw sweep failed: {exc}")
+
+        # ---- file carving (+ YARA on carved files) --------------------
+        carve_active = do_carve or do_yara
+        if carve_active and not w.cancelled:
+            carved_rows: list = []
+            counts = {"carved": 0, "yara": 0}
+            yara_by_rule: dict = {}
+
+            def on_carved(cf):
+                if w.cancelled:
+                    return
+                hashes = hash_bytes(cf.data)
+                yara_tags = []
+                if yara_scanner is not None:
+                    matches = yara_scanner.scan_bytes(
+                        cf.data, source=f"{cf.file_type}@{cf.offset:#x}")
+                    for m in matches:
+                        counts["yara"] += 1
+                        yara_by_rule[m.rule] = yara_by_rule.get(m.rule, 0) + 1
+                        yara_tags.append(m.rule)
+                row = {
+                    "inode": None,
+                    "path": f"/(carved)/{cf.file_type}/{cf.offset:#x}",
+                    "name": f"{cf.file_type}_{cf.offset:#x}.{cf.file_type}",
+                    "size_bytes": cf.size, "is_allocated": False,
+                    "md5": hashes["md5"], "sha256": hashes["sha256"],
+                    "tlsh": hashes["tlsh"],
+                }
+                carved_rows.append(row)
+                counts["carved"] += 1
+                if writer is not None and indexer is not None:
+                    body = row["name"]
+                    if yara_tags:
+                        body += "\nYARA: " + " ".join(yara_tags)
+                    indexer.add_doc(
+                        writer,
+                        case_doc_id=hash((ev_id, "carved", cf.offset))
+                        & 0x7FFFFFFFFFFFFFFF,
+                        path=row["path"], name=row["name"], body=body,
+                        encoding="binary", size_bytes=cf.size,
+                        sha256=hashes["sha256"] or "",
+                        tlsh=hashes["tlsh"] or "",
+                        evidence_uuid=evidence_uuid,
+                    )
+                if len(carved_rows) >= 100:
+                    case.add_files(ev_id, list(carved_rows))
+                    carved_rows.clear()
+
+            try:
+                with EwfHandle(segs) as ch:
+                    cstats = carve_stream(
+                        ch, max_files=100000, on_file=on_carved,
+                        progress_cb=lambda d, t: w.progress.emit(d, t, ""),
+                        cancel_cb=lambda: w.cancelled,
+                    )
+                if carved_rows:
+                    case.add_files(ev_id, carved_rows)
+                w.log.emit(f"  carved {cstats.carved} files  "
+                           f"{dict(cstats.per_type)}")
+                summary["carved"] = cstats.carved
+                case.log("ingest.carve", {"carved": cstats.carved,
+                                          "by_type": dict(cstats.per_type)})
+                if counts["yara"]:
+                    w.log.emit(f"  YARA matches on carved files: {yara_by_rule}")
+                    summary["yara"] = counts["yara"]
+                    case.log("ingest.yara", {"matches": counts["yara"],
+                                             "by_rule": yara_by_rule})
+            except Exception as exc:  # noqa: BLE001
+                w.log.emit(f"  [error] carving failed: {exc}")
+
+        return summary
+
     def _run(self):
         if not self.case:
             return
@@ -698,6 +897,10 @@ class IngestPanel(QWidget):
         do_vss = self.chk_vss.isChecked()
         do_vss_dedup = self.chk_vss_dedup.isChecked()
         credentials = self._credentials
+        do_raw_strings = self.chk_raw_strings.isChecked() and HAS_TANTIVY
+        do_raw_patterns = self.chk_raw_patterns.isChecked()
+        do_carve = self.chk_carve.isChecked()
+        do_yara = self.chk_yara.isChecked() and HAS_YARA_X
         # Content mode buffers up to ~1 MB of text per doc in the Tantivy
         # writer, so commit more often and give the writer a bigger heap.
         commit_every = 2000 if do_content else 5000
@@ -731,7 +934,7 @@ class IngestPanel(QWidget):
 
             indexer: Indexer | None = None
             writer = None
-            if do_index or do_content:
+            if do_index or do_content or do_raw_strings or do_raw_patterns:
                 try:
                     indexer = Indexer(case.index_dir / f"ev_{ev_id}")
                     writer = indexer.writer(heap_mb=heap_mb)
@@ -831,15 +1034,38 @@ class IngestPanel(QWidget):
                                              key=lambda kv: -kv[1]))
                 w.log.emit(f"  text extracted by type: {breakdown}")
 
+            # ---- raw-scan pass (Phase 2 + 3) ------------------------------
+            raw_summary = {}
+            do_any_raw = (do_raw_strings or do_raw_patterns or do_carve
+                          or do_yara)
+            if do_any_raw and not w.cancelled:
+                w.log.emit("=== raw scan pass (unallocated / carving / IoCs) ===")
+                raw_summary = self._raw_scan_pass(
+                    w, case, ev_id, evidence_uuid, segs, indexer, writer,
+                    do_raw_strings, do_raw_patterns, do_carve, do_yara,
+                )
+                if writer is not None:
+                    writer.commit()
+
             case.log("ingest.complete", {
                 "evidence_id": ev_id, "files": n_files,
                 "content_extracted": n_extracted,
                 "extract_stats": extract_stats,
+                "raw_scan": raw_summary,
                 "cancelled": w.cancelled,
             })
             summary = f"ingested {n_files} files"
             if do_content:
                 summary += f", extracted searchable text from {n_extracted}"
+            if raw_summary:
+                if raw_summary.get("raw_docs"):
+                    summary += f", {raw_summary['raw_docs']} raw-string docs"
+                if raw_summary.get("patterns"):
+                    summary += f", {raw_summary['patterns']} IoC hits"
+                if raw_summary.get("carved"):
+                    summary += f", {raw_summary['carved']} carved files"
+                if raw_summary.get("yara"):
+                    summary += f", {raw_summary['yara']} YARA matches"
             if w.cancelled:
                 summary += " (cancelled)"
             return True, summary
