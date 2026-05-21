@@ -18,6 +18,7 @@ from app.core.filesystem import walk_image, HAS_PYTSK3
 from app.core.hashing import hash_stream
 from app.core.hash_policy import HashPolicy
 from app.core.indexer import HAS_TANTIVY, Indexer
+from app.core.text_extract import extract_text, MAX_TEXT_CHARS
 from app.core.worker import Worker
 from app.ui.centered_msg import msg_error, msg_info, msg_question, msg_warn
 from app.ui.integrity_panel import quick_pre_flight
@@ -200,12 +201,51 @@ class IngestPanel(QWidget):
         opt_row.addSpacing(20)
         self.chk_hash = QCheckBox("Hash file contents per case policy (slow)")
         self.chk_hash.setChecked(True)
-        self.chk_index = QCheckBox("Index file names + ASCII body sample")
+        self.chk_index = QCheckBox("Index file names + paths")
         self.chk_index.setChecked(True)
         opt_row.addWidget(self.chk_hash)
         opt_row.addWidget(self.chk_index)
         opt_row.addStretch(1)
         ol.addLayout(opt_row)
+
+        # content-extraction row
+        content_row = QHBoxLayout()
+        self.chk_content = QCheckBox(
+            "Extract & index file CONTENTS (text inside PDFs, Office docs, "
+            "emails, text files)"
+        )
+        self.chk_content.setToolTip(
+            "Reads each regular file's bytes from the image and extracts its "
+            "text so search can match words inside documents — not just file "
+            "names. Significantly slower because it reads the actual file "
+            "data, not just metadata."
+        )
+        self.chk_content.toggled.connect(self._on_content_toggled)
+        content_row.addWidget(self.chk_content)
+        content_row.addSpacing(16)
+        content_row.addWidget(QLabel("Max file size to extract:"))
+        self.spin_content_mb = QSpinBox()
+        self.spin_content_mb.setRange(1, 1024)
+        self.spin_content_mb.setValue(32)
+        self.spin_content_mb.setSuffix(" MB")
+        self.spin_content_mb.setEnabled(False)
+        self.spin_content_mb.setToolTip(
+            "Files larger than this are skipped for content extraction "
+            "(their names are still indexed). Big media files rarely hold "
+            "searchable text and slow the walk down."
+        )
+        content_row.addWidget(self.spin_content_mb)
+        content_row.addStretch(1)
+        ol.addLayout(content_row)
+
+        content_note = QLabel(
+            "Supported: PDF · DOCX/XLSX/PPTX · MSG · EML · HTML · RTF · "
+            "plain-text & source files. Legacy DOC/XLS/PPT are detected but "
+            "not yet extracted (a future release). Pure-Python — no Java / Tika."
+        )
+        content_note.setObjectName("muted")
+        content_note.setWordWrap(True)
+        ol.addWidget(content_note)
 
         run_row = QHBoxLayout()
         self.btn_run = QPushButton("Ingest into Case")
@@ -308,6 +348,9 @@ class IngestPanel(QWidget):
         )
         if p:
             self.path_edit.setText(p)
+
+    def _on_content_toggled(self, checked: bool):
+        self.spin_content_mb.setEnabled(checked)
 
     def _clear_comp_results(self):
         while self.comp_form.rowCount() > 0:
@@ -544,11 +587,19 @@ class IngestPanel(QWidget):
         max_files = self.spin_max.value() or None
         do_hash = self.chk_hash.isChecked()
         do_index = self.chk_index.isChecked() and HAS_TANTIVY
+        do_content = self.chk_content.isChecked() and HAS_TANTIVY
+        max_content_bytes = self.spin_content_mb.value() * 1024 * 1024
+        # Content mode buffers up to ~1 MB of text per doc in the Tantivy
+        # writer, so commit more often and give the writer a bigger heap.
+        commit_every = 2000 if do_content else 5000
+        heap_mb = 256 if do_content else 128
 
         first = segs[0] if segs else self.path_edit.text().strip()
 
         def task(w: Worker) -> tuple[bool, str]:
             w.log.emit(f"Registering evidence: {first}")
+            if do_content:
+                w.log.emit(f"Content extraction ON (max {max_content_bytes // (1024*1024)} MB/file)")
             ev_id = case.add_evidence(
                 path=first, fmt=info.format, size=info.media_size,
                 md5=info.md5, sha256=None,
@@ -567,10 +618,10 @@ class IngestPanel(QWidget):
 
             indexer: Indexer | None = None
             writer = None
-            if do_index:
+            if do_index or do_content:
                 try:
                     indexer = Indexer(case.index_dir / f"ev_{ev_id}")
-                    writer = indexer.writer(heap_mb=128)
+                    writer = indexer.writer(heap_mb=heap_mb)
                 except Exception as exc:  # noqa: BLE001
                     w.log.emit(f"[warn] indexer init failed: {exc}")
                     indexer = None
@@ -578,23 +629,31 @@ class IngestPanel(QWidget):
 
             n_files = 0
             n_since_commit = 0
-            COMMIT_EVERY = 5000   # commit ~ every 5000 docs to bound memory
-                                  # and protect partial progress on crash
+            n_extracted = 0           # files with searchable text extracted
+            extract_stats: dict[str, int] = {}
             with EwfHandle(segs) as h:
-                files_iter = walk_image(h, max_files=max_files)
-                buf: list[dict] = []
+                files_iter = walk_image(
+                    h, max_files=max_files,
+                    read_content=do_content,
+                    max_content_bytes=max_content_bytes,
+                )
+                buf: list[dict] = []   # SQLite metadata batch (no file text)
                 t0 = time.time()
                 for rec in files_iter:
                     if w.cancelled:
                         break
-                    md5 = sha = tlsh = None
-                    if do_hash and rec.size_bytes and rec.size_bytes > 0 and rec.is_allocated:
-                        # Per-file content hashing keeps requiring the
-                        # FS_Info object alive across a worker pool; that
-                        # lands when we wire the multi-handle libewf
-                        # worker pool. The full-E01 hash from "Compute
-                        # Now" already produces the case-level fingerprint.
-                        pass
+
+                    # --- content extraction (text never buffered) -------
+                    body_text = rec.name
+                    if do_content and rec.content:
+                        result = extract_text(rec.name, rec.content)
+                        rec.content = None   # free the raw bytes immediately
+                        if result.ok():
+                            body_text = rec.name + "\n" + result.text
+                            n_extracted += 1
+                            extract_stats[result.extractor] = \
+                                extract_stats.get(result.extractor, 0) + 1
+
                     row = {
                         "inode": rec.inode, "path": rec.path, "name": rec.name,
                         "size_bytes": rec.size_bytes,
@@ -602,63 +661,70 @@ class IngestPanel(QWidget):
                         "ctime": rec.ctime, "crtime": rec.crtime,
                         "is_allocated": rec.is_allocated,
                         "ads_name": rec.ads_name,
-                        "md5": md5, "sha256": sha, "tlsh": tlsh,
+                        "md5": None, "sha256": None, "tlsh": None,
                     }
                     buf.append(row)
+
+                    # --- index this doc right away ----------------------
+                    if writer is not None:
+                        indexer.add_doc(
+                            writer,
+                            case_doc_id=hash((ev_id, rec.path)) & 0x7FFFFFFFFFFFFFFF,
+                            path=rec.path, name=rec.name,
+                            body=body_text,
+                            encoding="utf-8",
+                            size_bytes=rec.size_bytes or 0,
+                            sha256="", tlsh="",
+                            evidence_uuid=evidence_uuid,
+                        )
+                    n_files += 1
+                    n_since_commit += 1
+
+                    # --- flush the SQLite metadata batch ----------------
                     if len(buf) >= 250:
                         case.add_files(ev_id, buf)
-                        n_files += len(buf)
-                        n_since_commit += len(buf)
-                        if writer is not None:
-                            for r in buf:
-                                indexer.add_doc(
-                                    writer,
-                                    case_doc_id=hash((ev_id, r["path"])) & 0x7FFFFFFFFFFFFFFF,
-                                    path=r["path"], name=r["name"],
-                                    body=r["name"],
-                                    encoding="utf-8",
-                                    size_bytes=r["size_bytes"] or 0,
-                                    sha256=r["sha256"] or "",
-                                    tlsh=r["tlsh"] or "",
-                                    evidence_uuid=evidence_uuid,
-                                )
-                        # Incremental commit — bounds the Tantivy heap
-                        # and means a crash mid-ingest doesn't lose the
-                        # whole index, only the last sub-5000 docs.
-                        if writer is not None and n_since_commit >= COMMIT_EVERY:
-                            w.log.emit(f"  …intermediate commit at {n_files:,} files")
-                            writer.commit()
-                            n_since_commit = 0
-                        w.progress.emit(n_files, max_files or 0, "")
-                        w.log.emit(f"  …{n_files} files enumerated "
-                                   f"({n_files / max(time.time()-t0, 0.01):.0f}/s)")
                         buf.clear()
+
+                    # --- incremental Tantivy commit ---------------------
+                    if writer is not None and n_since_commit >= commit_every:
+                        w.log.emit(f"  …intermediate commit at {n_files:,} files")
+                        writer.commit()
+                        n_since_commit = 0
+
+                    # --- progress / log every 250 files -----------------
+                    if n_files % 250 == 0:
+                        w.progress.emit(n_files, max_files or 0, "")
+                        rate = n_files / max(time.time() - t0, 0.01)
+                        extra = f", {n_extracted} with text" if do_content else ""
+                        w.log.emit(f"  …{n_files} files enumerated "
+                                   f"({rate:.0f}/s{extra})")
+
+                # final SQLite flush
                 if buf:
                     case.add_files(ev_id, buf)
-                    n_files += len(buf)
-                    if writer is not None:
-                        for r in buf:
-                            indexer.add_doc(
-                                writer,
-                                case_doc_id=hash((ev_id, r["path"])) & 0x7FFFFFFFFFFFFFFF,
-                                path=r["path"], name=r["name"],
-                                body=r["name"],
-                                encoding="utf-8",
-                                size_bytes=r["size_bytes"] or 0,
-                                sha256=r["sha256"] or "",
-                                tlsh=r["tlsh"] or "",
-                                evidence_uuid=evidence_uuid,
-                            )
 
             if writer is not None:
                 w.log.emit("Committing index…")
                 writer.commit()
 
+            if do_content and extract_stats:
+                breakdown = ", ".join(f"{k}={v}" for k, v in
+                                      sorted(extract_stats.items(),
+                                             key=lambda kv: -kv[1]))
+                w.log.emit(f"  text extracted by type: {breakdown}")
+
             case.log("ingest.complete", {
                 "evidence_id": ev_id, "files": n_files,
+                "content_extracted": n_extracted,
+                "extract_stats": extract_stats,
                 "cancelled": w.cancelled,
             })
-            return True, f"ingested {n_files} files{' (cancelled)' if w.cancelled else ''}"
+            summary = f"ingested {n_files} files"
+            if do_content:
+                summary += f", extracted searchable text from {n_extracted}"
+            if w.cancelled:
+                summary += " (cancelled)"
+            return True, summary
 
         self._start_worker(task, total_hint=max_files or 0)
 

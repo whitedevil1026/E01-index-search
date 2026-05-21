@@ -30,6 +30,11 @@ class FileRec:
     crtime: float | None = None
     is_allocated: bool = True
     ads_name: str | None = None
+    is_regular: bool = False
+    # Raw file bytes, only populated when walk_image(read_content=True).
+    # The caller is expected to consume + free this immediately
+    # (the walker is a generator, so only one rec is live at a time).
+    content: bytes | None = None
     extra: dict = field(default_factory=dict)
 
 
@@ -62,8 +67,18 @@ class EwfImgInfo:
         return self._inner
 
 
-def walk_image(ewf_handle, max_files: int | None = None) -> Iterator[FileRec]:
-    """Walk every filesystem in the image and yield FileRec rows."""
+def walk_image(ewf_handle, max_files: int | None = None,
+               read_content: bool = False,
+               max_content_bytes: int = 32 * 1024 * 1024) -> Iterator[FileRec]:
+    """Walk every filesystem in the image and yield FileRec rows.
+
+    read_content     — when True, the bytes of each regular file are read
+                       and attached to FileRec.content. The walk becomes
+                       I/O-bound on the file data (much slower) so this
+                       is opt-in.
+    max_content_bytes — per-file cap on how many bytes are read; larger
+                       files are read up to this limit and truncated.
+    """
     if not HAS_PYTSK3:
         yield FileRec(
             inode=None, path="/", name="(pytsk3 not installed)",
@@ -80,7 +95,9 @@ def walk_image(ewf_handle, max_files: int | None = None) -> Iterator[FileRec]:
         # No partition table (single-FS image) OR partition-probe error.
         # Fall through to "treat as one filesystem at offset 0".
         try:
-            yield from _walk_fs(img, offset=0, max_files=max_files)
+            yield from _walk_fs(img, offset=0, max_files=max_files,
+                                read_content=read_content,
+                                max_content_bytes=max_content_bytes)
         except Exception as fs_exc:  # noqa: BLE001
             yield FileRec(
                 inode=None, path="/", name=f"(fs-parse-error: {fs_exc})",
@@ -95,7 +112,9 @@ def walk_image(ewf_handle, max_files: int | None = None) -> Iterator[FileRec]:
             continue
         try:
             for rec in _walk_fs(img, offset=part.start * vol.info.block_size,
-                                max_files=max_files):
+                                max_files=max_files,
+                                read_content=read_content,
+                                max_content_bytes=max_content_bytes):
                 yield rec
                 count += 1
                 if max_files and count >= max_files:
@@ -108,13 +127,32 @@ def walk_image(ewf_handle, max_files: int | None = None) -> Iterator[FileRec]:
             )
 
 
-def _walk_fs(img, offset: int, max_files: int | None) -> Iterator[FileRec]:
+def _walk_fs(img, offset: int, max_files: int | None,
+             read_content: bool = False,
+             max_content_bytes: int = 32 * 1024 * 1024) -> Iterator[FileRec]:
     fs = pytsk3.FS_Info(img, offset=offset)
     root = fs.open_dir(path="/")
-    yield from _walk_dir(fs, root, "/", max_files, {"count": 0})
+    yield from _walk_dir(fs, root, "/", max_files, {"count": 0},
+                         read_content, max_content_bytes)
 
 
-def _walk_dir(fs, directory, path: str, max_files: int | None, counter: dict) -> Iterator[FileRec]:
+def _read_entry_content(entry, size: int, max_bytes: int) -> bytes | None:
+    """Read up to max_bytes of a regular file's content via pytsk3."""
+    read_n = min(size, max_bytes)
+    if read_n <= 0:
+        return None
+    try:
+        return entry.read_random(0, read_n)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _walk_dir(fs, directory, path: str, max_files: int | None, counter: dict,
+              read_content: bool = False,
+              max_content_bytes: int = 32 * 1024 * 1024) -> Iterator[FileRec]:
+    pytsk3_mod = __import__("pytsk3")
+    type_reg = getattr(pytsk3_mod, "TSK_FS_META_TYPE_REG", 1)
+    type_dir = getattr(pytsk3_mod, "TSK_FS_META_TYPE_DIR", 2)
     for entry in directory:
         if max_files and counter["count"] >= max_files:
             return
@@ -130,9 +168,16 @@ def _walk_dir(fs, directory, path: str, max_files: int | None, counter: dict) ->
         full = path.rstrip("/") + "/" + name
         meta = entry.info.meta
         size = meta.size if meta else None
-        is_alloc = bool(entry.info.name.flags & getattr(__import__("pytsk3"),
+        is_alloc = bool(entry.info.name.flags & getattr(pytsk3_mod,
                                                        "TSK_FS_NAME_FLAG_ALLOC", 1))
+        is_reg = bool(meta and meta.type == type_reg)
         counter["count"] += 1
+
+        content = None
+        if (read_content and is_reg and is_alloc
+                and size and size > 0):
+            content = _read_entry_content(entry, size, max_content_bytes)
+
         yield FileRec(
             inode=meta.addr if meta else None,
             path=full, name=name, size_bytes=size,
@@ -141,11 +186,14 @@ def _walk_dir(fs, directory, path: str, max_files: int | None, counter: dict) ->
             ctime=getattr(meta, "ctime", None) if meta else None,
             crtime=getattr(meta, "crtime", None) if meta else None,
             is_allocated=is_alloc,
+            is_regular=is_reg,
+            content=content,
         )
         # Recurse into subdirs
         try:
-            if meta and meta.type == __import__("pytsk3").TSK_FS_META_TYPE_DIR:
+            if meta and meta.type == type_dir:
                 sub = entry.as_directory()
-                yield from _walk_dir(fs, sub, full, max_files, counter)
+                yield from _walk_dir(fs, sub, full, max_files, counter,
+                                     read_content, max_content_bytes)
         except Exception:
             continue

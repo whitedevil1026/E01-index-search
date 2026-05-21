@@ -42,24 +42,23 @@ class SearchPanel(QWidget):
         title.setObjectName("h1")
         root.addWidget(title)
 
-        # IMPORTANT scope banner: this build indexes file names + paths.
-        # File contents (text inside PDFs, Office docs, raw bytes) will
-        # be indexed in a future release. Users searching for words that
-        # only appear inside a file's body would otherwise get 0 results
-        # with no explanation, so we warn up front.
+        # Scope banner: search covers file names + paths always, and file
+        # *contents* too if the ingest was run with the "Extract & index
+        # file contents" option. Files whose ingest didn't extract text
+        # (or types not yet supported) match on name only.
         scope_banner = QLabel(
-            "<b>Currently indexed:</b> file names and file paths from the "
-            "filesystem walk.  "
-            "<b>Not yet indexed:</b> file contents (text inside PDFs, Office "
-            "documents, raw bytes, etc.) &mdash; that is on the roadmap. "
-            "Searching for words that only appear inside a file's body will "
-            "return zero hits until then."
+            "<b>Searchable:</b> file names, file paths, and &mdash; for "
+            "evidence ingested with <i>Extract &amp; index file contents</i> "
+            "enabled &mdash; the text inside PDFs, DOCX/XLSX/PPTX, MSG, EML, "
+            "HTML, RTF and plain-text files.  "
+            "If an ingest was run with content extraction OFF, only names "
+            "and paths are searchable for that evidence item."
         )
         scope_banner.setWordWrap(True)
         scope_banner.setTextFormat(Qt.RichText)
         scope_banner.setStyleSheet(
-            "color:#f59e0b; background:#1a1d24; padding:8px; "
-            "border-radius:4px; border-left:3px solid #f59e0b;"
+            "color:#9ca0ad; background:#1a1d24; padding:8px; "
+            "border-radius:4px; border-left:3px solid #2563eb;"
         )
         root.addWidget(scope_banner)
 
@@ -268,8 +267,9 @@ class SearchPanel(QWidget):
                     "segment(s) ({ms:.0f} ms). "
                     "The case has <b>{docs:,}</b> indexed docs so search ran "
                     "fine &mdash; the query just didn't match anything. "
-                    "Reminder: this build indexes file names only, not file "
-                    "contents. Hints: {tips}".format(
+                    "If you expected a hit inside a document, check the "
+                    "evidence was ingested with content extraction enabled. "
+                    "Hints: {tips}".format(
                         q=q, n=segments_searched, ms=dt_ms,
                         docs=total_docs, tips="  ".join(tips),
                     ),
