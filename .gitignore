@@ -1,3 +1,6 @@
+# Local-only development aids (not part of the published project)
+PROJECT_HANDOFF.md
+
 # Python
 __pycache__/
 *.py[cod]
