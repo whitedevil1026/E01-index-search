@@ -1,7 +1,9 @@
 # PROJECT HANDOFF — E01 Index & Search
 
 > Read this file first to resume the project cold in a new chat.
-> Last updated: after Phase 4 completion (commit `2337aec`).
+> Last updated: after Phases 1/4/5 brought to 100% + full audit
+> (commit `6f800d1`). Phases 0-5 complete; only optional Phase 6 left.
+> Working tree clean, everything pushed.
 
 ---
 
@@ -73,6 +75,9 @@ that could not be completed — see §8.
 
 ### Phase 1 — Image access
 - `libewf-python` E01 reader; `EwfHandle` file-like wrapper
+- **Raw / dd image support** — `RawHandle` (same interface as
+  `EwfHandle`); `inspect()` auto-detects EWF vs raw vs AFF4;
+  `open_handle()` factory; `raw_media_hash()` single-pass hash
 - Partition enumeration; **encryption** (BitLocker/FileVault/LUKS via
   pybde/pyfvde/pyluksde) with a key-escrow dialog
 - **VSS** (Volume Shadow Copies) via pyvshadow + cross-snapshot dedup
@@ -107,7 +112,9 @@ that could not be completed — see §8.
   - PST/OST → libpff (every message)
   - Registry hives → libregf (every key/value)
   - ESE databases → libesedb (every table row)
-  - SQLite DBs → stdlib (every table row, read-only/immutable)
+  - SQLite DBs → stdlib, **with WAL replay** — the ingest defers SQLite
+    DBs + their `-wal`/`-shm` side files to a post-walk pass so the
+    write-ahead log is replayed and un-checkpointed rows recovered
   - Defender quarantine → RC4 decode (static key)
   - Encrypted chat DBs / memory / pcap → detect & flag
 - Each container yields per-item Tantivy docs (`mailbox.pst#Inbox/msg_42`)
@@ -272,24 +279,42 @@ Revisit if a maintained AFF4 library appears.
 
 ---
 
-## 9. Commit history (recent first)
+## 9. Verification status
+
+- **Code audit** (independent review of all ~33 modules): zero defects
+  across imports, naming, Qt usage, exception handling, resource
+  leaks, logic, state handling, forensic-correctness, dead code, UI.
+- **Runtime verification**: 38 files parse, 30 modules import, 7 tabs
+  build, empty states safe, all dialogs construct.
+- **End-to-end**: 9-stage pipeline on the SANS image — integrity,
+  volume scan, parallel hash, ingest, search, raw scan, findings,
+  signed manifest, audit chain — all pass.
+- **Regression** (after the raw/AFF4/WAL additions): 18/18 checks —
+  E01 path, artifact dispatcher, parse_sqlite, text_extract, full
+  pipeline and GUI all unaffected.
+
+## 10. Commit history (recent first)
 
 ```
-2337aec  Phase 4 — specialized artifact parsing (PST/registry/ESE/SQLite)
-f08af84  Phase 5 — per-file hashing, regex & TLSH search, results export
+6f800d1  Phases 1/4/5 to 100% — raw images, AFF4 detection, SQLite WAL
+7198e2e  docs: professional README — purpose, design intent
+fe3dfde  docs: add PROJECT_HANDOFF.md — cold-resume reference
+2337aec  Phase 4 complete — specialized artifact parsing
+f08af84  Phase 5 — per-file hashing, regex & TLSH search, export
 7bc9397  Phase 3 complete — findings persistence + Findings browser
 a7b088e  Phase 2 complete + Phase 3 raw scan / carving / IoC / YARA
+32f4e3a  Phase 1 complete — encryption, VSS, direct FS, parallel reads
 2bf6639  Phase 2 — file-content indexing (search inside documents)
 e49227c  incremental commits + drag-drop + About dialog
 4d77e4b  polish: centered popups + tooltips + Ctrl+F + empty states
-378e67d  polish: rewrite README + remove "try1" from user-facing text
+378e67d  polish: rewrite README + remove "try1" naming
 5d5697a  chore: switch license MIT -> Apache 2.0 + add NOTICE
-628e272  Initial commit
+628e272 / 04d64ed  Initial commits
 ```
 
 ---
 
-## 10. How to continue in a new chat
+## 11. How to continue in a new chat
 
 1. Read this file and `F:\e01 indexing\e01 md file.md` (the plan).
 2. The working folder is `F:\e01 indexing\try1\` — everything is there.
