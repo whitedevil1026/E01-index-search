@@ -110,6 +110,15 @@ def probe_all() -> list[Dep]:
                ["extract-msg"], friendly="extract-msg"),
         _probe("yara_x", "YARA-X IoC scanning",
                ["yara-x"], friendly="YARA-X"),
+        _probe("pypff", "Outlook PST/OST mail-store parser",
+               ["libpff-python"], friendly="libpff-python",
+               notes="Phase 4 — bundled wheel in ./wheels/."),
+        _probe("pyregf", "Windows Registry hive parser",
+               ["libregf-python>=20240421"], friendly="libregf-python",
+               notes="Phase 4 — bundled wheel; prebuilt on PyPI too."),
+        _probe("pyesedb", "ESE database parser (Edge/SRUM/Search)",
+               ["libesedb-python>=20240420"], friendly="libesedb-python",
+               notes="Phase 4 — bundled wheel; prebuilt on PyPI too."),
     ]
 
 

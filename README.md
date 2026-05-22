@@ -157,8 +157,18 @@ picks them up automatically.
 - **Raw scan** — paged multi-encoding string sweep over unallocated
   space and slack (ASCII / UTF-8 / UTF-16 / CJK), IoC pattern
   extraction (emails, URLs, IPs, Luhn-checked cards, crypto
-  addresses, phones), file-signature carving (JPEG/PNG/GIF/PDF/BMP)
+  addresses, phones), file-signature carving (JPEG/PNG/GIF/PDF)
   and YARA-X scanning of carved files
+- **Specialized artifacts** — looks *inside* container files:
+  Outlook PST/OST mail stores, Windows Registry hives, ESE
+  databases (Edge/SRUM/Search), SQLite databases (browser/app/chat),
+  Microsoft Defender quarantine (RC4-decoded). Encrypted chat DBs
+  (WhatsApp crypt14/15, Signal SQLCipher), memory images and PCAPs
+  are detected and flagged
+- **Search** — keyword / exact-name / regex (RE2) / SHA-256 prefix /
+  TLSH similarity; per-file MD5+SHA-256+TLSH; results export
+- **Findings** — browse IoC indicators, YARA matches, carved files
+  and flagged artifacts; CSV export
 - **Integrity** — EWF segment verification + FTK-style reporting
 - **Court-defensibility** — hash-chained audit log, Ed25519 manifest
 

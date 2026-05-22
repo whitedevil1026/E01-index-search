@@ -79,6 +79,7 @@ class FindingsPanel(QWidget):
         self.cmb_mode.addItem("IoC indicators", "ioc")
         self.cmb_mode.addItem("YARA matches", "yara")
         self.cmb_mode.addItem("Carved files", "carved")
+        self.cmb_mode.addItem("Flagged artifacts", "artifact")
         self.cmb_mode.currentIndexChanged.connect(self._on_mode_change)
         bar.addWidget(self.cmb_mode)
 
@@ -158,7 +159,7 @@ class FindingsPanel(QWidget):
         self.cmb_subtype.blockSignals(True)
         self.cmb_subtype.clear()
         self.cmb_subtype.addItem("(all)", None)
-        if self.case is not None and self._mode in ("ioc", "yara"):
+        if self.case is not None and self._mode in ("ioc", "yara", "artifact"):
             summ = self.case.findings_summary().get(self._mode, {})
             for sub in sorted(summ.keys()):
                 self.cmb_subtype.addItem(f"{sub} ({summ[sub]:,})", sub)
@@ -198,7 +199,9 @@ class FindingsPanel(QWidget):
         self.tbl.setColumnWidth(0, 110)
         self.tbl.setColumnWidth(1, 520)
         self.tbl.setColumnWidth(2, 110)
-        kind_name = {"ioc": "IoC indicators", "yara": "YARA matches"}[self._mode]
+        kind_name = {"ioc": "IoC indicators", "yara": "YARA matches",
+                     "artifact": "flagged artifacts"}.get(
+                         self._mode, self._mode)
         total_occ = sum(r["count"] for r in self._rows)
         self.lbl_summary.setText(
             f"{len(self._rows):,} distinct {kind_name}  "

@@ -27,6 +27,7 @@ from app.core.raw_scan import raw_string_sweep
 from app.core import patterns as pat_mod
 from app.core.carver import carve_stream
 from app.core.hashing import hash_bytes
+from app.core import artifacts as art_mod
 try:
     from app.core.yara_scan import YaraScanner, HAS_YARA_X
 except Exception:  # noqa: BLE001
@@ -274,6 +275,20 @@ class IngestPanel(QWidget):
         content_note.setObjectName("muted")
         content_note.setWordWrap(True)
         ol.addWidget(content_note)
+
+        # Specialized artifacts row
+        self.chk_artifacts = QCheckBox(
+            "Parse specialized artifacts — Outlook PST/OST, Windows "
+            "Registry hives, ESE databases, SQLite DBs, Defender quarantine"
+        )
+        self.chk_artifacts.setChecked(True)
+        self.chk_artifacts.setToolTip(
+            "Look INSIDE container files: index every Outlook message, "
+            "registry key/value, ESE/SQLite row. Decrypts Microsoft "
+            "Defender quarantine files. Encrypted chat DBs, memory images "
+            "and packet captures are detected and flagged in Findings."
+        )
+        ol.addWidget(self.chk_artifacts)
 
         # VSS (Volume Shadow Copy) row
         vss_row = QHBoxLayout()
@@ -975,15 +990,16 @@ class IngestPanel(QWidget):
         do_hash = self.chk_hash.isChecked()
         do_index = self.chk_index.isChecked() and HAS_TANTIVY
         do_content = self.chk_content.isChecked() and HAS_TANTIVY
+        do_artifacts = self.chk_artifacts.isChecked() and HAS_TANTIVY
         max_content_bytes = self.spin_content_mb.value() * 1024 * 1024
-        # When hashing files we need the COMPLETE file content, so the
-        # read cap is raised. Files larger than this are not hashed
-        # (a partial hash would be forensically wrong) — they are
-        # counted and reported instead.
+        # When hashing files (or parsing artifact containers) we need the
+        # COMPLETE file content, so the read cap is raised. Files larger
+        # than this are not hashed (a partial hash would be forensically
+        # wrong) — they are counted and reported instead.
         HASH_FILE_CAP = 256 * 1024 * 1024
-        need_content = do_content or do_hash
+        need_content = do_content or do_hash or do_artifacts
         walk_content_cap = (max(max_content_bytes, HASH_FILE_CAP)
-                            if do_hash else max_content_bytes)
+                            if (do_hash or do_artifacts) else max_content_bytes)
         do_vss = self.chk_vss.isChecked()
         do_vss_dedup = self.chk_vss_dedup.isChecked()
         credentials = self._credentials
@@ -1038,6 +1054,10 @@ class IngestPanel(QWidget):
             n_extracted = 0           # files with searchable text extracted
             n_hashed = 0              # files hashed
             n_hash_skipped = 0        # files too large to hash fully
+            n_artifacts = 0           # specialized containers parsed
+            n_artifact_items = 0      # sub-docs from those containers
+            artifact_stats: dict[str, int] = {}
+            flagged_artifacts: list[dict] = []   # memory/pcap/encrypted DBs
             extract_stats: dict[str, int] = {}
             with EwfHandle(segs) as h:
                 files_iter = walk_image(
@@ -1073,9 +1093,52 @@ class IngestPanel(QWidget):
                             # would be wrong, so skip it
                             n_hash_skipped += 1
 
-                    # --- content extraction (text never buffered) -------
+                    # --- specialized artifact parsing -------------------
+                    # PST / registry / ESE / SQLite / Defender quarantine
+                    # are container formats — parse them and index every
+                    # message / key / row as its own searchable doc.
                     body_text = rec.name
-                    if do_content and content:
+                    artifact_kind = ""
+                    if (do_artifacts and content and rec.is_regular
+                            and writer is not None):
+                        artifact_kind = art_mod.detect_artifact(
+                            rec.name, content[:64])
+                        if artifact_kind in art_mod.PARSEABLE:
+                            items, summ = art_mod.parse_artifact(
+                                artifact_kind, content, rec.path)
+                            for it in items:
+                                indexer.add_doc(
+                                    writer,
+                                    case_doc_id=hash((ev_id, rec.path,
+                                                      it.subpath))
+                                    & 0x7FFFFFFFFFFFFFFF,
+                                    path=f"{rec.path}#{it.subpath}",
+                                    name=it.name,
+                                    body=f"{it.name}\n{it.text}",
+                                    encoding="artifact",
+                                    size_bytes=0, sha256="", tlsh="",
+                                    evidence_uuid=evidence_uuid,
+                                )
+                            n_artifacts += 1
+                            n_artifact_items += len(items)
+                            n_since_commit += len(items)
+                            artifact_stats[artifact_kind] = \
+                                artifact_stats.get(artifact_kind, 0) + 1
+                            body_text = (f"{rec.name}\n[{art_mod.HUMAN[artifact_kind]}"
+                                         f" — {len(items)} items extracted]")
+                        elif artifact_kind in art_mod.FLAG_ONLY:
+                            flagged_artifacts.append({
+                                "kind": "artifact",
+                                "subtype": artifact_kind,
+                                "value": rec.path, "count": 1,
+                            })
+                            body_text = (f"{rec.name}\n[{art_mod.HUMAN[artifact_kind]}"
+                                         f" — detected, flagged in Findings]")
+
+                    # --- generic content extraction ---------------------
+                    # (only when the file was not a parsed artifact)
+                    if (do_content and content
+                            and artifact_kind not in art_mod.PARSEABLE):
                         result = extract_text(rec.name, content)
                         if result.ok():
                             body_text = rec.name + "\n" + result.text
@@ -1144,6 +1207,23 @@ class IngestPanel(QWidget):
                                              key=lambda kv: -kv[1]))
                 w.log.emit(f"  text extracted by type: {breakdown}")
 
+            if do_artifacts and (n_artifacts or flagged_artifacts):
+                w.log.emit(
+                    f"  artifacts parsed: {n_artifacts} container(s) -> "
+                    f"{n_artifact_items:,} indexed items  {artifact_stats}")
+                if flagged_artifacts:
+                    by_kind: dict[str, int] = {}
+                    for fa in flagged_artifacts:
+                        by_kind[fa["subtype"]] = by_kind.get(fa["subtype"], 0) + 1
+                    w.log.emit(f"  artifacts flagged (need separate tools): "
+                               f"{by_kind}")
+                    # record memory/pcap/encrypted-DB hits in Findings
+                    try:
+                        case.add_findings(ev_id, flagged_artifacts)
+                    except Exception as exc:  # noqa: BLE001
+                        w.log.emit(f"  [warn] could not store flagged "
+                                   f"artifacts: {exc}")
+
             # ---- raw-scan pass (Phase 2 + 3) ------------------------------
             raw_summary = {}
             do_any_raw = (do_raw_strings or do_raw_patterns or do_carve
@@ -1167,6 +1247,10 @@ class IngestPanel(QWidget):
                 "content_extracted": n_extracted,
                 "files_hashed": n_hashed,
                 "hash_skipped_oversize": n_hash_skipped,
+                "artifacts_parsed": n_artifacts,
+                "artifact_items": n_artifact_items,
+                "artifact_stats": artifact_stats,
+                "artifacts_flagged": len(flagged_artifacts),
                 "extract_stats": extract_stats,
                 "raw_scan": raw_summary,
                 "cancelled": w.cancelled,
@@ -1176,6 +1260,11 @@ class IngestPanel(QWidget):
                 summary += f", hashed {n_hashed}"
             if do_content:
                 summary += f", extracted searchable text from {n_extracted}"
+            if do_artifacts and n_artifacts:
+                summary += (f", parsed {n_artifacts} artifact container(s) "
+                            f"-> {n_artifact_items:,} items")
+            if flagged_artifacts:
+                summary += f", flagged {len(flagged_artifacts)} artifact(s)"
             if raw_summary:
                 if raw_summary.get("raw_docs"):
                     summary += f", {raw_summary['raw_docs']} raw-string docs"
