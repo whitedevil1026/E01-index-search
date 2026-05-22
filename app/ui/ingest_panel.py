@@ -976,6 +976,14 @@ class IngestPanel(QWidget):
         do_index = self.chk_index.isChecked() and HAS_TANTIVY
         do_content = self.chk_content.isChecked() and HAS_TANTIVY
         max_content_bytes = self.spin_content_mb.value() * 1024 * 1024
+        # When hashing files we need the COMPLETE file content, so the
+        # read cap is raised. Files larger than this are not hashed
+        # (a partial hash would be forensically wrong) — they are
+        # counted and reported instead.
+        HASH_FILE_CAP = 256 * 1024 * 1024
+        need_content = do_content or do_hash
+        walk_content_cap = (max(max_content_bytes, HASH_FILE_CAP)
+                            if do_hash else max_content_bytes)
         do_vss = self.chk_vss.isChecked()
         do_vss_dedup = self.chk_vss_dedup.isChecked()
         credentials = self._credentials
@@ -1028,12 +1036,14 @@ class IngestPanel(QWidget):
             n_files = 0
             n_since_commit = 0
             n_extracted = 0           # files with searchable text extracted
+            n_hashed = 0              # files hashed
+            n_hash_skipped = 0        # files too large to hash fully
             extract_stats: dict[str, int] = {}
             with EwfHandle(segs) as h:
                 files_iter = walk_image(
                     h, max_files=max_files,
-                    read_content=do_content,
-                    max_content_bytes=max_content_bytes,
+                    read_content=need_content,
+                    max_content_bytes=walk_content_cap,
                     credentials=credentials,
                     include_vss=do_vss,
                     vss_dedup=do_vss_dedup,
@@ -1045,16 +1055,34 @@ class IngestPanel(QWidget):
                     if w.cancelled:
                         break
 
+                    content = rec.content
+                    rec.content = None        # detach; freed at loop end
+
+                    # --- per-file hashing -------------------------------
+                    md5 = sha256 = tlsh = None
+                    if do_hash and content and rec.is_regular:
+                        full = (rec.size_bytes is None
+                                or len(content) >= rec.size_bytes)
+                        if full:
+                            hh = hash_bytes(content)
+                            md5, sha256, tlsh = (hh["md5"], hh["sha256"],
+                                                 hh["tlsh"])
+                            n_hashed += 1
+                        else:
+                            # file exceeded the read cap — a partial hash
+                            # would be wrong, so skip it
+                            n_hash_skipped += 1
+
                     # --- content extraction (text never buffered) -------
                     body_text = rec.name
-                    if do_content and rec.content:
-                        result = extract_text(rec.name, rec.content)
-                        rec.content = None   # free the raw bytes immediately
+                    if do_content and content:
+                        result = extract_text(rec.name, content)
                         if result.ok():
                             body_text = rec.name + "\n" + result.text
                             n_extracted += 1
                             extract_stats[result.extractor] = \
                                 extract_stats.get(result.extractor, 0) + 1
+                    content = None            # free the raw bytes now
 
                     row = {
                         "inode": rec.inode, "path": rec.path, "name": rec.name,
@@ -1064,7 +1092,7 @@ class IngestPanel(QWidget):
                         "is_allocated": rec.is_allocated,
                         "ads_name": rec.ads_name,
                         "vss_snapshot_id": rec.vss_snapshot_id,
-                        "md5": None, "sha256": None, "tlsh": None,
+                        "md5": md5, "sha256": sha256, "tlsh": tlsh,
                     }
                     buf.append(row)
 
@@ -1077,7 +1105,7 @@ class IngestPanel(QWidget):
                             body=body_text,
                             encoding="utf-8",
                             size_bytes=rec.size_bytes or 0,
-                            sha256="", tlsh="",
+                            sha256=sha256 or "", tlsh=tlsh or "",
                             evidence_uuid=evidence_uuid,
                         )
                     n_files += 1
@@ -1129,14 +1157,23 @@ class IngestPanel(QWidget):
                 if writer is not None:
                     writer.commit()
 
+            if do_hash:
+                w.log.emit(f"  per-file hashing: {n_hashed} hashed, "
+                           f"{n_hash_skipped} skipped (larger than "
+                           f"{HASH_FILE_CAP // (1024*1024)} MB)")
+
             case.log("ingest.complete", {
                 "evidence_id": ev_id, "files": n_files,
                 "content_extracted": n_extracted,
+                "files_hashed": n_hashed,
+                "hash_skipped_oversize": n_hash_skipped,
                 "extract_stats": extract_stats,
                 "raw_scan": raw_summary,
                 "cancelled": w.cancelled,
             })
             summary = f"ingested {n_files} files"
+            if do_hash:
+                summary += f", hashed {n_hashed}"
             if do_content:
                 summary += f", extracted searchable text from {n_extracted}"
             if raw_summary:

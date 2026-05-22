@@ -345,6 +345,40 @@ class Case:
                 "md5", "sha256", "tlsh"]
         return [dict(zip(cols, r)) for r in rows]
 
+    # ---- TLSH similarity -------------------------------------------------
+
+    def tlsh_lookup(self, sha256: str) -> str | None:
+        """Return the TLSH hash of the file with the given SHA-256."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT tlsh FROM files WHERE sha256=? AND tlsh IS NOT NULL "
+                "AND tlsh != '' LIMIT 1", (sha256,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def tlsh_similar(self, query_tlsh: str, max_distance: int = 100,
+                     limit: int = 300) -> list[dict]:
+        """Find files whose TLSH hash is within `max_distance` of the
+        query hash. Returns rows sorted nearest-first.
+
+        TLSH distance scale: 0 = identical, 1-30 very similar,
+        30-100 somewhat similar, >200 likely unrelated.
+        """
+        from app.core.hashing import tlsh_distance
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT path, name, size_bytes, sha256, tlsh FROM files "
+                "WHERE tlsh IS NOT NULL AND tlsh != ''"
+            ).fetchall()
+        out: list[dict] = []
+        for path, name, size, sha, tl in rows:
+            d = tlsh_distance(query_tlsh, tl)
+            if d is not None and d <= max_distance:
+                out.append({"path": path, "name": name, "size_bytes": size,
+                            "sha256": sha, "tlsh": tl, "distance": d})
+        out.sort(key=lambda r: r["distance"])
+        return out[:limit]
+
     # ---- audit log -------------------------------------------------------
 
     def log(self, action: str, payload: dict[str, Any], actor: str = "examiner") -> None:

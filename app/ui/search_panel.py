@@ -19,9 +19,9 @@ import time
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QMessageBox, QPushButton, QSpinBox, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from app.core.indexer import HAS_TANTIVY, Indexer
@@ -33,6 +33,8 @@ class SearchPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.case = None
+        self._last_results: list = []   # rows from the last search, for export
+        self._last_mode: str = ""
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 20, 20, 20)
@@ -79,6 +81,7 @@ class SearchPanel(QWidget):
         self.mode = QComboBox()
         self.mode.addItem("Keyword / full-text", "fulltext")
         self.mode.addItem("Exact name (substring)", "name")
+        self.mode.addItem("Regex (name / path)", "regex")
         self.mode.addItem("SHA-256 prefix", "sha256")
         self.mode.addItem("TLSH similar to…", "tlsh")
         self.mode.currentIndexChanged.connect(self._on_mode_change)
@@ -90,6 +93,20 @@ class SearchPanel(QWidget):
         self.q.returnPressed.connect(self._run)
         bar.addWidget(self.q, 1)
 
+        # TLSH distance threshold — only shown in TLSH mode
+        self.lbl_dist = QLabel("Max distance:")
+        self.spin_dist = QSpinBox()
+        self.spin_dist.setRange(1, 1000)
+        self.spin_dist.setValue(80)
+        self.spin_dist.setToolTip(
+            "TLSH distance: 0 identical, 1-30 very similar, "
+            "30-100 somewhat similar, >200 unrelated."
+        )
+        self.lbl_dist.setVisible(False)
+        self.spin_dist.setVisible(False)
+        bar.addWidget(self.lbl_dist)
+        bar.addWidget(self.spin_dist)
+
         bar.addWidget(QLabel("Limit:"))
         self.limit = QSpinBox()
         self.limit.setRange(1, 1000)
@@ -99,6 +116,12 @@ class SearchPanel(QWidget):
         self.btn = QPushButton("Search")
         self.btn.clicked.connect(self._run)
         bar.addWidget(self.btn)
+
+        self.btn_export = QPushButton("Export results…")
+        self.btn_export.setObjectName("secondary")
+        self.btn_export.setEnabled(False)
+        self.btn_export.clicked.connect(self._export_results)
+        bar.addWidget(self.btn_export)
 
         # info button for TLSH
         self.tlsh_help_btn = info_button("tlsh", self)
@@ -179,10 +202,14 @@ class SearchPanel(QWidget):
         placeholders = {
             "fulltext": "e.g. invoice  |  password  |  ntfs",
             "name":     "exact-name substring, e.g. system32 (case-insensitive)",
+            "regex":    r"RE2 regex, e.g.  invoice.*2026   |   \d{4}-\d{4}",
             "sha256":   "SHA-256 hex prefix, e.g. a1b2c3 — finds files whose hash starts with it",
-            "tlsh":     "paste a TLSH hash to find files similar to it (requires hashed files in case)",
+            "tlsh":     "paste a TLSH hash, or a SHA-256 of an already-hashed file, to find similar files",
         }
         self.q.setPlaceholderText(placeholders.get(mode, ""))
+        is_tlsh = (mode == "tlsh")
+        self.lbl_dist.setVisible(is_tlsh)
+        self.spin_dist.setVisible(is_tlsh)
 
     # ---- search ------------------------------------------------------
 
@@ -201,24 +228,32 @@ class SearchPanel(QWidget):
     def _run(self):
         if not self.case:
             return
-        if not HAS_TANTIVY:
-            msg_info(self, "tantivy missing",
-                     "Install tantivy-py to enable search.")
-            return
         q = self.q.text().strip()
         if not q:
             self._set_status("Type a query first.", "warn")
             return
-
         mode = self.mode.currentData()
+
+        # TLSH similarity is a database scan, not a Tantivy query.
+        if mode == "tlsh":
+            self._run_tlsh(q)
+            return
+
+        if not HAS_TANTIVY:
+            msg_info(self, "tantivy missing",
+                     "Install tantivy-py to enable search.")
+            return
+
         self._set_status(f"Working — searching '{q}'…", "working")
         self.btn.setEnabled(False)
+        self.btn_export.setEnabled(False)
         self.tbl.setRowCount(0)
         QGuiApplication.processEvents()
 
         t0 = time.time()
         try:
-            hits, segments_searched, query_used, fallback = self._search_with_fallback(q, mode)
+            hits, segments_searched, query_used, fallback = \
+                self._search_with_fallback(q, mode)
         except Exception as exc:  # noqa: BLE001
             self._set_status(f"<b>Error:</b> {type(exc).__name__}: {exc}", "error")
             self.btn.setEnabled(True)
@@ -227,7 +262,9 @@ class SearchPanel(QWidget):
         dt_ms = (time.time() - t0) * 1000
         self.btn.setEnabled(True)
 
-        # populate
+        # ---- render (Score / Path / Name / Size / Encoding / SHA-256) --
+        self.tbl.setHorizontalHeaderLabels(
+            ["Score", "Path", "Name", "Size", "Encoding", "SHA-256"])
         self.tbl.setRowCount(len(hits))
         for i, h in enumerate(hits):
             self.tbl.setItem(i, 0, QTableWidgetItem(f"{h.score:.3f}"))
@@ -237,9 +274,18 @@ class SearchPanel(QWidget):
             self.tbl.setItem(i, 4, QTableWidgetItem(h.encoding or ""))
             self.tbl.setItem(i, 5, QTableWidgetItem((h.sha256 or "")[:16]))
         self.tbl.resizeColumnsToContents()
-        # avoid the Path column collapsing to a tiny width
         if self.tbl.columnWidth(1) < 280:
             self.tbl.setColumnWidth(1, 280)
+
+        # keep results for export
+        self._last_results = [
+            {"score": f"{h.score:.3f}", "path": h.path, "name": h.name,
+             "size_bytes": h.size_bytes, "encoding": h.encoding or "",
+             "sha256": h.sha256 or ""}
+            for h in hits
+        ]
+        self._last_mode = mode
+        self.btn_export.setEnabled(bool(hits))
 
         # status
         if len(hits) == 0:
@@ -302,22 +348,46 @@ class SearchPanel(QWidget):
 
     # ---- query execution --------------------------------------------
 
+    def _index_dirs(self):
+        for sub in sorted(self.case.index_dir.iterdir()):
+            if sub.is_dir() and (sub / "meta.json").exists():
+                yield sub
+
     def _search_with_fallback(self, q: str, mode: str):
         """Returns (hits, segments_searched, query_used, fallback_used)."""
-        index_root = self.case.index_dir
-        # fan-out: one Tantivy index per evidence subdir
+        limit = self.limit.value()
         all_hits = []
         n_idx = 0
+
+        # ---- regex mode — Tantivy RE2 query over name + path ----------
+        if mode == "regex":
+            for sub in self._index_dirs():
+                idx = Indexer(sub)
+                for field in ("name", "path"):
+                    try:
+                        all_hits.extend(
+                            idx.regex_search(q, field=field, limit=limit))
+                    except Exception:  # noqa: BLE001
+                        pass
+                n_idx += 1
+            # dedup (a doc can match on both name and path)
+            seen = set()
+            deduped = []
+            for h in all_hits:
+                k = (h.path, h.name)
+                if k not in seen:
+                    seen.add(k)
+                    deduped.append(h)
+            return deduped[:limit], n_idx, f"regex:/{q}/", False
+
+        # ---- standard query modes -------------------------------------
         query_to_use = self._format_query(q, mode)
-        for sub in sorted(index_root.iterdir()):
-            if not sub.is_dir() or not (sub / "meta.json").exists():
-                continue
+        for sub in self._index_dirs():
             idx = Indexer(sub)
-            hits = idx.search(query_to_use, limit=self.limit.value())
-            all_hits.extend(hits)
+            all_hits.extend(idx.search(query_to_use, limit=limit))
             n_idx += 1
         all_hits.sort(key=lambda h: h.score, reverse=True)
-        all_hits = all_hits[: self.limit.value()]
+        all_hits = all_hits[:limit]
 
         # Smart fallback: if 0 hits and the query has spaces, try spaceless
         used_fallback = False
@@ -325,14 +395,12 @@ class SearchPanel(QWidget):
             alt_q = q.replace(" ", "")
             alt_formatted = self._format_query(alt_q, mode)
             alt_hits = []
-            for sub in sorted(index_root.iterdir()):
-                if not sub.is_dir() or not (sub / "meta.json").exists():
-                    continue
+            for sub in self._index_dirs():
                 idx = Indexer(sub)
-                alt_hits.extend(idx.search(alt_formatted, limit=self.limit.value()))
+                alt_hits.extend(idx.search(alt_formatted, limit=limit))
             alt_hits.sort(key=lambda h: h.score, reverse=True)
             if alt_hits:
-                all_hits = alt_hits[: self.limit.value()]
+                all_hits = alt_hits[:limit]
                 query_to_use = alt_formatted
                 used_fallback = True
 
@@ -366,10 +434,121 @@ class SearchPanel(QWidget):
             return f"name:*{q}*"
         if mode == "sha256":
             return f"sha256:{q.lower()}*"
-        if mode == "tlsh":
-            # try1 doesn't yet implement distance-search; fall back to exact prefix
-            return f"tlsh:{q.upper()}*"
         return q
+
+    # ---- TLSH similarity search --------------------------------------
+
+    def _run_tlsh(self, q: str):
+        """TLSH similarity is a database scan over per-file TLSH hashes,
+        not a Tantivy query. The input is either a TLSH hash or the
+        SHA-256 of an already-hashed file (whose TLSH we look up).
+        """
+        self._set_status("Working — TLSH similarity search…", "working")
+        self.btn.setEnabled(False)
+        self.btn_export.setEnabled(False)
+        self.tbl.setRowCount(0)
+        QGuiApplication.processEvents()
+
+        seed = q.strip()
+        seed_note = ""
+        query_tlsh = seed
+        # a 64-hex string is a SHA-256 — resolve it to the file's TLSH
+        if len(seed) == 64 and all(c in "0123456789abcdefABCDEF" for c in seed):
+            tl = self.case.tlsh_lookup(seed.lower())
+            if not tl:
+                self.btn.setEnabled(True)
+                self._set_status(
+                    "No hashed file with that SHA-256 in the case. TLSH "
+                    "search needs evidence ingested with <b>Hash file "
+                    "contents</b> enabled.", "warn")
+                return
+            query_tlsh = tl
+            seed_note = f" (seed file SHA-256 {seed[:12]}…)"
+
+        t0 = time.time()
+        try:
+            results = self.case.tlsh_similar(
+                query_tlsh, max_distance=self.spin_dist.value(),
+                limit=self.limit.value())
+        except Exception as exc:  # noqa: BLE001
+            self.btn.setEnabled(True)
+            self._set_status(f"<b>Error:</b> {type(exc).__name__}: {exc}",
+                             "error")
+            return
+        dt_ms = (time.time() - t0) * 1000
+        self.btn.setEnabled(True)
+
+        # render — Distance / Path / Name / Size / (blank) / SHA-256
+        self.tbl.setHorizontalHeaderLabels(
+            ["Distance", "Path", "Name", "Size", "", "SHA-256"])
+        self.tbl.setRowCount(len(results))
+        for i, r in enumerate(results):
+            self.tbl.setItem(i, 0, QTableWidgetItem(str(r["distance"])))
+            self.tbl.setItem(i, 1, QTableWidgetItem(r["path"]))
+            self.tbl.setItem(i, 2, QTableWidgetItem(r["name"]))
+            self.tbl.setItem(i, 3, QTableWidgetItem(str(r["size_bytes"] or "")))
+            self.tbl.setItem(i, 4, QTableWidgetItem(""))
+            self.tbl.setItem(i, 5, QTableWidgetItem((r["sha256"] or "")[:16]))
+        self.tbl.resizeColumnsToContents()
+        if self.tbl.columnWidth(1) < 280:
+            self.tbl.setColumnWidth(1, 280)
+
+        self._last_results = [
+            {"distance": r["distance"], "path": r["path"], "name": r["name"],
+             "size_bytes": r["size_bytes"], "sha256": r["sha256"],
+             "tlsh": r["tlsh"]}
+            for r in results
+        ]
+        self._last_mode = "tlsh"
+        self.btn_export.setEnabled(bool(results))
+
+        if not results:
+            self._set_status(
+                f"<b>0 files</b> within TLSH distance "
+                f"{self.spin_dist.value()}{seed_note} ({dt_ms:.0f} ms). "
+                "TLSH search only sees files ingested with <b>Hash file "
+                "contents</b> enabled — and carved files.", "warn")
+        else:
+            self._set_status(
+                f"<b>{len(results)} similar file(s)</b> within TLSH distance "
+                f"{self.spin_dist.value()}{seed_note} ({dt_ms:.0f} ms). "
+                "Nearest first (0 = identical).", "ok")
+
+        self.case.log("query.tlsh", {
+            "seed": seed[:80], "max_distance": self.spin_dist.value(),
+            "results": len(results), "duration_ms": int(dt_ms),
+        })
+        mw = self.window()
+        if hasattr(mw, "audit_panel"):
+            mw.audit_panel.refresh()
+
+    # ---- export ------------------------------------------------------
+
+    def _export_results(self):
+        if not self._last_results:
+            return
+        import csv
+        p, _ = QFileDialog.getSaveFileName(
+            self, "Export search results",
+            f"search_{self._last_mode}_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+            "CSV (*.csv)")
+        if not p:
+            return
+        try:
+            cols = list(self._last_results[0].keys())
+            with open(p, "w", newline="", encoding="utf-8") as fh:
+                wr = csv.DictWriter(fh, fieldnames=cols)
+                wr.writeheader()
+                wr.writerows(self._last_results)
+        except Exception as exc:  # noqa: BLE001
+            msg_info(self, "Export failed", str(exc))
+            return
+        if self.case:
+            self.case.log("query.export",
+                          {"mode": self._last_mode,
+                           "rows": len(self._last_results), "path": p})
+        msg_info(self, "Results exported",
+                 f"Wrote {len(self._last_results)} rows to:\n{p}")
 
     def _copy_cell(self, row: int, col: int):
         item = self.tbl.item(row, col)

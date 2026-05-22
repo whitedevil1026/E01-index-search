@@ -114,20 +114,14 @@ class Indexer:
 
     # ---- read ------------------------------------------------------------
 
-    def search(self, query_str: str, limit: int = 50) -> list[Hit]:
-        q = normalize_query(query_str)
-        self.index.reload()
-        searcher = self.index.searcher()
-        parser = self.index.parse_query(q, ["body", "name"])
-        results = searcher.search(parser, limit=limit).hits
+    def _collect(self, searcher, results, limit: int) -> list[Hit]:
         hits: list[Hit] = []
         for score, addr in results:
             doc = searcher.doc(addr)
             def _g(field):
                 try:
-                    v = doc.get_first(field)
-                    return v
-                except Exception:
+                    return doc.get_first(field)
+                except Exception:  # noqa: BLE001
                     return None
             hits.append(Hit(
                 case_doc_id=int(_g("case_doc_id") or 0),
@@ -139,3 +133,31 @@ class Indexer:
                 sha256=_g("sha256"),
             ))
         return hits
+
+    def search(self, query_str: str, limit: int = 50) -> list[Hit]:
+        q = normalize_query(query_str)
+        self.index.reload()
+        searcher = self.index.searcher()
+        parser = self.index.parse_query(q, ["body", "name"])
+        results = searcher.search(parser, limit=limit).hits
+        return self._collect(searcher, results, limit)
+
+    def regex_search(self, pattern: str, field: str = "name",
+                     limit: int = 50) -> list[Hit]:
+        """Run a Tantivy RE2 regex query against one field.
+
+        RE2 has no catastrophic backtracking, so an examiner-supplied
+        pattern cannot hang the UI.
+
+        The regex matches whole indexed *terms*. The `name` and `body`
+        fields are tokenised + lowercased, so the pattern is lowercased
+        to match; the `path` field uses the `raw` tokenizer (the whole
+        path is one case-preserved term), so its pattern is used as-is.
+        """
+        self.index.reload()
+        searcher = self.index.searcher()
+        pat = pattern if field in ("path", "sha256", "tlsh",
+                                   "encoding") else pattern.lower()
+        rq = tantivy.Query.regex_query(self.schema, field, pat)
+        results = searcher.search(rq, limit=limit).hits
+        return self._collect(searcher, results, limit)
