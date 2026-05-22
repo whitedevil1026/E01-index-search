@@ -64,12 +64,15 @@ that plan.
 
 **Image access**
 - Read EWF / EnCase `.E01` images (and `.Ex01 / .L01` variants)
+- Read **raw / dd images** (`.dd / .raw / .img / .001 / .bin`) — a flat
+  sector dump is opened through the same pipeline as an E01
 - Partition enumeration; whole-disk and single-volume images
-- Multi-handle **parallel media hashing** — bit-identical to a
-  single-threaded read, verified
+- Multi-handle **parallel media hashing** for E01 (bit-identical to a
+  single-threaded read, verified); single-pass hashing for raw images
 - **EWF integrity verification** — missing segments, bad signatures,
   segment-number mismatches, broken Adler-32 trailers, `next`/`done`
   markers; full acquisition-metadata extraction; FTK-style reports
+- AFF4 images are detected and reported (see *Known limitations*)
 
 **Encrypted and shadowed volumes**
 - **BitLocker, FileVault 2, LUKS** detection and key-escrow unlock
@@ -255,12 +258,31 @@ app/ui/
 Six of the seven planned phases are complete: Foundation, Image
 Access, Indexing Core, Raw Scan / Carving, Specialized Artefacts, and
 Search / UI / Export. The tool is functionally complete for
-single-examiner, per-case E01 forensics.
+single-examiner, per-case forensics on E01 and raw images.
 
-**Not yet implemented** (deliberately deferred, low priority): AFF4
-image format support, NSRL RDS known-file filtering, multi-image case
-stitching and distributed (Quickwit) scale-out for multi-terabyte
-corpora, and optional embedding/vector search.
+**Not yet implemented** (Phase 6 — deliberately deferred, the review
+document marked it "only if needed"): multi-image case stitching,
+cross-case hash deduplication, and distributed (Quickwit) scale-out
+for multi-terabyte corpora.
+
+## Known limitations
+
+- **AFF4 images are detected but not parsed.** The only Python AFF4
+  library, `pyaff4` (last released 2021), pins an abandoned dependency
+  chain (`pyyaml==5.4`, `rdflib[sparql]==4.2.2`, `tzlocal==2.1`,
+  `CryptoPlus`) that does not install or run cleanly on Python 3.10.
+  Shipping a forced, untestable AFF4 path in a forensic tool would be
+  worse than an honest limitation. **Workaround:** the tool detects an
+  AFF4 image and tells the examiner to convert it to E01 or raw/dd
+  first (every acquisition suite can export those). Raw/dd support was
+  added specifically so this conversion target is always available.
+- **Encrypted chat databases** (WhatsApp `crypt14/15`, Signal
+  SQLCipher) are detected and flagged but not decrypted — decryption
+  requires the per-device key, which is out of band.
+- **Memory images and packet captures** are detected and flagged for
+  routing to Volatility 3 / Zeek; their raw bytes are not indexed.
+- NSRL RDS known-file filtering and embedding/vector search are not
+  implemented (the review document marked both optional).
 
 `PROJECT_HANDOFF.md` documents the full status, architecture and
 remaining work in detail.

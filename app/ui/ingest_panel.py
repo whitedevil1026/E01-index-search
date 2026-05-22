@@ -14,7 +14,8 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.ewf_reader import (
-    inspect, glob_segments, EwfHandle, parallel_hash, HAS_PYEWF,
+    inspect, glob_segments, EwfHandle, RawHandle, open_handle,
+    parallel_hash, raw_media_hash, HAS_PYEWF,
 )
 from app.core.filesystem import walk_image, scan_volumes, HAS_PYTSK3
 from app.core.hashing import hash_stream
@@ -516,7 +517,7 @@ class IngestPanel(QWidget):
             return
         self._append_log("Scanning volumes…")
         try:
-            with EwfHandle(self._segs) as h:
+            with open_handle(self._info) as h:
                 vols = scan_volumes(h)
         except Exception as exc:  # noqa: BLE001
             msg_error(self, "Scan failed", f"{type(exc).__name__}: {exc}")
@@ -617,21 +618,31 @@ class IngestPanel(QWidget):
         segs = list(self._segs)
         n_workers = 4
         media_size_holder = {"size": 0}
+        is_raw = (self._info is not None and self._info.format == "RAW")
 
         def task(w: Worker) -> tuple[bool, str]:
-            # Hash the decompressed MEDIA CONTENT (the imaged disk), using
-            # multiple libewf handles in parallel. This is the value that
-            # is directly comparable to the acquisition hash recorded in
-            # the E01 header — the gold-standard image-verification check.
-            w.log.emit(f"Parallel media hash — {n_workers} libewf handles")
+            # Hash the decompressed MEDIA CONTENT (the imaged disk). For
+            # an E01, multiple libewf handles decompress in parallel; for
+            # a raw/dd image there is nothing to decompress, so a single
+            # streaming pass is used. Either way the result is directly
+            # comparable to the acquisition hash.
             t0 = time.time()
             try:
-                result = parallel_hash(
-                    segs, list(policy.all_algos()),
-                    n_workers=n_workers, block_size=16 * 1024 * 1024,
-                    progress_cb=lambda d, t: w.progress.emit(d, t, ""),
-                    cancel_cb=lambda: w.cancelled,
-                )
+                if is_raw:
+                    w.log.emit("Media hash — raw image, single streaming pass")
+                    result = raw_media_hash(
+                        segs[0], list(policy.all_algos()),
+                        progress_cb=lambda d, t: w.progress.emit(d, t, ""),
+                        cancel_cb=lambda: w.cancelled,
+                    )
+                else:
+                    w.log.emit(f"Parallel media hash — {n_workers} libewf handles")
+                    result = parallel_hash(
+                        segs, list(policy.all_algos()),
+                        n_workers=n_workers, block_size=16 * 1024 * 1024,
+                        progress_cb=lambda d, t: w.progress.emit(d, t, ""),
+                        cancel_cb=lambda: w.cancelled,
+                    )
             except Exception as exc:  # noqa: BLE001
                 if w.cancelled:
                     return False, "cancelled by user"
@@ -739,18 +750,36 @@ class IngestPanel(QWidget):
     def _inspect(self):
         p = self.path_edit.text().strip()
         if not p or not Path(p).exists():
-            msg_warn(self, "Missing", "Pick an existing E01 file.")
+            msg_warn(self, "Missing",
+                     "Pick an existing image file (.E01 / .Ex01 / .L01 or "
+                     "a raw .dd / .img / .raw / .001).")
             return
         info = inspect(p)
         self._info = info
         self._segs = info.segment_files
         self.lbl_format.setText(info.format)
-        self.lbl_segments.setText(f"{len(info.segment_files)} files")
+        unit = "files" if info.format not in ("RAW", "AFF4") else "file"
+        self.lbl_segments.setText(f"{len(info.segment_files)} {unit}")
         self.lbl_size.setText(f"{info.media_size:,} bytes")
         self.lbl_encrypted.setText("yes" if info.is_encrypted else "no")
         self.lbl_acq_md5.setText(info.md5 or "—")
         self.lbl_acq_sha1.setText(info.sha1 or "—")
-        if not HAS_PYEWF:
+
+        if info.format == "AFF4":
+            self._append_log("[warn] AFF4 image detected — not supported by "
+                             "this build. Convert to E01 or raw/dd first.")
+            msg_warn(self, "AFF4 not supported",
+                     "This is an AFF4 image. AFF4 is not supported because "
+                     "the only Python AFF4 library (pyaff4) has an "
+                     "abandoned dependency chain that will not run on "
+                     "current Python.\n\nConvert the image to E01 or raw "
+                     "(dd) and re-open it.")
+            self.btn_compute.setEnabled(False)
+            return
+        if info.format == "RAW":
+            self._append_log(f"[ok] raw/dd image — {info.media_size:,} bytes "
+                             "(flat disk dump, no EWF metadata)")
+        elif not HAS_PYEWF:
             self._append_log("[warn] libewf-python (pyewf) not installed — "
                              "inspection shows segment list only. Install: "
                              "pip install libewf-python==20240506")
@@ -841,7 +870,7 @@ class IngestPanel(QWidget):
                     counters["raw_docs"] += 1
 
             try:
-                with EwfHandle(segs) as rh:
+                with open_handle(self._info) as rh:
                     stats = raw_string_sweep(
                         rh, on_page=on_page,
                         progress_cb=lambda d, t: w.progress.emit(d, t, ""),
@@ -926,7 +955,7 @@ class IngestPanel(QWidget):
                     carved_rows.clear()
 
             try:
-                with EwfHandle(segs) as ch:
+                with open_handle(self._info) as ch:
                     cstats = carve_stream(
                         ch, max_files=100000, on_file=on_carved,
                         progress_cb=lambda d, t: w.progress.emit(d, t, ""),
@@ -963,6 +992,11 @@ class IngestPanel(QWidget):
         if not self._info or not self._segs:
             msg_warn(self, "Inspect first",
                      "Inspect an image before ingesting.")
+            return
+        if self._info.format == "AFF4":
+            msg_warn(self, "AFF4 not supported",
+                     "AFF4 images cannot be ingested by this build. "
+                     "Convert the image to E01 or raw/dd first.")
             return
         if self._info.is_encrypted:
             ret = msg_question(
@@ -1059,7 +1093,14 @@ class IngestPanel(QWidget):
             artifact_stats: dict[str, int] = {}
             flagged_artifacts: list[dict] = []   # memory/pcap/encrypted DBs
             extract_stats: dict[str, int] = {}
-            with EwfHandle(segs) as h:
+            # SQLite DBs + their -wal/-shm side files are deferred to a
+            # post-walk pass so the write-ahead log can be replayed
+            # (the -wal file is a separate filesystem entry that usually
+            # appears AFTER its database in the walk order).
+            sqlite_stash: dict[str, bytes] = {}
+            sqlite_stash_bytes = 0
+            SQLITE_STASH_CAP = 400 * 1024 * 1024
+            with open_handle(info) as h:
                 files_iter = walk_image(
                     h, max_files=max_files,
                     read_content=need_content,
@@ -1103,7 +1144,40 @@ class IngestPanel(QWidget):
                             and writer is not None):
                         artifact_kind = art_mod.detect_artifact(
                             rec.name, content[:64])
-                        if artifact_kind in art_mod.PARSEABLE:
+                        nlow = rec.name.lower()
+                        if artifact_kind == art_mod.SQLITE or \
+                                nlow.endswith(("-wal", "-shm")):
+                            # Defer SQLite DBs and their WAL/SHM side
+                            # files to a post-walk pass for WAL replay.
+                            if sqlite_stash_bytes + len(content) <= SQLITE_STASH_CAP:
+                                sqlite_stash[rec.path] = content
+                                sqlite_stash_bytes += len(content)
+                                if artifact_kind == art_mod.SQLITE:
+                                    body_text = (f"{rec.name}\n[SQLite database "
+                                                 "— queued for WAL-aware parsing]")
+                            elif artifact_kind == art_mod.SQLITE:
+                                # stash full — parse now, without WAL
+                                items, summ = art_mod.parse_artifact(
+                                    artifact_kind, content, rec.path)
+                                for it in items:
+                                    indexer.add_doc(
+                                        writer,
+                                        case_doc_id=hash((ev_id, rec.path,
+                                                          it.subpath))
+                                        & 0x7FFFFFFFFFFFFFFF,
+                                        path=f"{rec.path}#{it.subpath}",
+                                        name=it.name,
+                                        body=f"{it.name}\n{it.text}",
+                                        encoding="artifact",
+                                        size_bytes=0, sha256="", tlsh="",
+                                        evidence_uuid=evidence_uuid,
+                                    )
+                                n_artifacts += 1
+                                n_artifact_items += len(items)
+                                n_since_commit += len(items)
+                                artifact_stats["sqlite"] = \
+                                    artifact_stats.get("sqlite", 0) + 1
+                        elif artifact_kind in art_mod.PARSEABLE:
                             items, summ = art_mod.parse_artifact(
                                 artifact_kind, content, rec.path)
                             for it in items:
@@ -1196,6 +1270,47 @@ class IngestPanel(QWidget):
                 # final SQLite flush
                 if buf:
                     case.add_files(ev_id, buf)
+
+            # ---- post-walk SQLite pass (WAL replay) -----------------------
+            # Now that the whole directory tree has been walked, every
+            # database has its -wal side file available. Parse each DB,
+            # replaying its WAL so the most recent (un-checkpointed)
+            # chat messages / history rows are recovered.
+            if do_artifacts and sqlite_stash and writer is not None and not w.cancelled:
+                db_paths = [p for p in sqlite_stash
+                            if not p.lower().endswith(("-wal", "-shm"))]
+                n_wal = 0
+                w.log.emit(f"  parsing {len(db_paths)} SQLite database(s) "
+                           "with WAL replay…")
+                for db_path in db_paths:
+                    if w.cancelled:
+                        break
+                    db_bytes = sqlite_stash.get(db_path)
+                    wal_bytes = sqlite_stash.get(db_path + "-wal")
+                    if wal_bytes:
+                        n_wal += 1
+                    items, summ = art_mod.parse_artifact(
+                        art_mod.SQLITE, db_bytes, db_path,
+                        wal_content=wal_bytes)
+                    for it in items:
+                        indexer.add_doc(
+                            writer,
+                            case_doc_id=hash((ev_id, db_path, it.subpath))
+                            & 0x7FFFFFFFFFFFFFFF,
+                            path=f"{db_path}#{it.subpath}",
+                            name=it.name,
+                            body=f"{it.name}\n{it.text}",
+                            encoding="artifact",
+                            size_bytes=0, sha256="", tlsh="",
+                            evidence_uuid=evidence_uuid,
+                        )
+                    n_artifacts += 1
+                    n_artifact_items += len(items)
+                    artifact_stats["sqlite"] = \
+                        artifact_stats.get("sqlite", 0) + 1
+                w.log.emit(f"  SQLite: {len(db_paths)} database(s), "
+                           f"{n_wal} with a WAL replayed")
+                sqlite_stash.clear()
 
             if writer is not None:
                 w.log.emit("Committing index…")

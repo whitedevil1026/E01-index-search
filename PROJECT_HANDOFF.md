@@ -44,16 +44,21 @@ user will validate Phase 4 on a real **100 GB image** they have.
 
 ```
 Phase 0 — Foundation .............. DONE      100%
-Phase 1 — Image access ............ DONE      ~95%
+Phase 1 — Image access ............ DONE      100%
 Phase 2 — Indexing core ........... DONE      100%
 Phase 3 — Raw scan / carving ...... DONE      100%
-Phase 4 — Specialized artifacts ... DONE      ~95%
-Phase 5 — Search / UI / export .... DONE      ~95%
+Phase 4 — Specialized artifacts ... DONE      100%
+Phase 5 — Search / UI / export .... DONE      100%
 Phase 6 — Multi-case / scale-out .. NOT STARTED 0%  (optional)
 ```
 
-The tool is **functionally complete** for single-examiner, per-case E01
-forensics. Phase 6 was flagged "only if needed" by the plan itself.
+The tool is **functionally complete** for single-examiner, per-case
+forensics on E01 and raw/dd images. Phase 6 was flagged "only if
+needed" by the plan itself.
+
+Phases 1/4/5 were brought to 100% by adding raw/dd image support
+(Phase 1 + 5) and SQLite WAL replay (Phase 4). AFF4 is the one item
+that could not be completed — see §8.
 
 ---
 
@@ -241,8 +246,19 @@ checkbox. Expect ~23 walked files + ~3,300 carved + ~11k IoC indicators.
 - Quickwit-backed mode for >5 TB corpora / multi-examiner
 - Cross-case hash deduplication
 
+### AFF4 — attempted, blocked by upstream (documented limitation)
+`pyaff4` 0.34 (the only Python AFF4 library, last released 2021) pins
+an abandoned dependency chain — `pyyaml==5.4`, `rdflib[sparql]==4.2.2`,
+`tzlocal==2.1`, `CryptoPlus` — none of which install/run cleanly on
+Python 3.10. `pyaff4` itself installs `--no-deps` but its runtime
+needs those exact old versions and would be fragile and untestable
+(no AFF4 sample image on hand). **Decision:** AFF4 is *detected*
+(`inspect()` returns format `AFF4`, `open_handle()` raises a clear
+error, the Ingest panel tells the examiner to convert to E01/raw).
+Raw/dd support was added so that conversion target always exists.
+Revisit if a maintained AFF4 library appears.
+
 ### Smaller leftover items (low priority, plan-deferred)
-- **AFF4** image format support (`pyaff4` is on PyPI, 0.34)
 - **NSRL RDS** known-file hash filter (was a Phase 0 wish, never built)
 - VSS dedup currently keys on `path|size|mtime`, not SHA-256 (pragmatic)
 - Tantivy `en_stem` field variant for stemmed search
@@ -250,6 +266,9 @@ checkbox. Expect ~23 walked files + ~3,300 carved + ~11k IoC indicators.
 - Custom YARA rules: loadable, but no persistent per-case rule store
 - PST/registry/ESE parsing tested only on synthetic data + graceful-
   failure — needs validation on the user's real 100 GB image
+- SQLite WAL replay correlates the `-wal` sidecar via a deferred
+  post-walk pass (bounded to 400 MB of stashed DBs); a DB whose `-wal`
+  is unallocated or in a different directory won't be WAL-merged
 
 ---
 

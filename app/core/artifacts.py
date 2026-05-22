@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import io
 import os
+import shutil
 import sqlite3
 import struct
 import tempfile
@@ -445,26 +446,44 @@ def parse_esedb(content: bytes, source: str = "",
 # ---- SQLite database ------------------------------------------------------
 
 def parse_sqlite(content: bytes, source: str = "",
-                 max_rows_per_table: int = 200_000) -> Iterator[ArtifactItem]:
-    """Parse a SQLite DB. stdlib sqlite3 needs a path, so the bytes are
-    written to a temp file. WAL is not applied here (the -wal side file
-    is a separate filesystem object); the committed DB is parsed.
+                 max_rows_per_table: int = 200_000,
+                 wal_content: Optional[bytes] = None) -> Iterator[ArtifactItem]:
+    """Parse a SQLite DB.
+
+    stdlib sqlite3 needs a path, so the DB bytes are written to a temp
+    file. If `wal_content` (the `-wal` write-ahead-log side file) is
+    supplied it is written alongside as `<temp>-wal` and SQLite replays
+    its uncommitted transactions on open — recovering the most recent
+    chat messages / history rows that had not yet been checkpointed.
+
+    Forensic note: the ORIGINAL evidence is never touched. Only a
+    throwaway temp COPY is opened, and only that copy is read.
     """
-    tmp_path = None
+    tmp_dir = None
     try:
-        fd, tmp_path = tempfile.mkstemp(suffix=".sqlite")
-        with os.fdopen(fd, "wb") as fh:
+        tmp_dir = tempfile.mkdtemp(prefix="e01sqlite_")
+        tmp_path = os.path.join(tmp_dir, "db.sqlite")
+        with open(tmp_path, "wb") as fh:
             fh.write(content)
-        # immutable + read-only — never mutate evidence
-        uri = f"file:{tmp_path}?immutable=1&mode=ro"
+        if wal_content:
+            with open(tmp_path + "-wal", "wb") as fh:
+                fh.write(wal_content)
+            # WAL replay requires a normal (non-immutable) open on the
+            # temp copy so SQLite can checkpoint the log into the DB.
+            uri = f"file:{tmp_path}"
+        else:
+            # no WAL — open the copy strictly read-only
+            uri = f"file:{tmp_path}?immutable=1&mode=ro"
         conn = sqlite3.connect(uri, uri=True)
         conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
-    except Exception:  # noqa: BLE001
-        if tmp_path and os.path.exists(tmp_path):
+        if wal_content:
             try:
-                os.unlink(tmp_path)
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except Exception:  # noqa: BLE001
                 pass
+    except Exception:  # noqa: BLE001
+        if tmp_dir and os.path.isdir(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
         return
     try:
         cur = conn.cursor()
@@ -503,11 +522,8 @@ def parse_sqlite(content: bytes, source: str = "",
             conn.close()
         except Exception:  # noqa: BLE001
             pass
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except Exception:  # noqa: BLE001
-                pass
+        if tmp_dir and os.path.isdir(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ---- Microsoft Defender quarantine ---------------------------------------
@@ -600,32 +616,36 @@ def parse_defender_quarantine(content: bytes, source: str = "",
 
 # ---- dispatcher -----------------------------------------------------------
 
-def parse_artifact(kind: str, content: bytes,
-                   source: str = "") -> tuple[list[ArtifactItem], ArtifactSummary]:
+def parse_artifact(kind: str, content: bytes, source: str = "",
+                   wal_content: Optional[bytes] = None
+                   ) -> tuple[list[ArtifactItem], ArtifactSummary]:
     """Parse a detected artifact. Returns (items, summary).
 
-    For FLAG_ONLY kinds no parsing happens — an empty item list and a
-    summary describing what was found is returned.
+    `wal_content` is the SQLite `-wal` side file, when one was found —
+    it is passed through to the SQLite parser for write-ahead-log
+    replay. For FLAG_ONLY kinds no parsing happens.
     """
     summary = ArtifactSummary(kind=kind)
     if kind in FLAG_ONLY:
         summary.note = HUMAN.get(kind, kind)
         return [], summary
 
-    parser = {
-        PST: parse_pst,
-        REGISTRY: parse_registry,
-        ESEDB: parse_esedb,
-        SQLITE: parse_sqlite,
-        DEFENDER_QUARANTINE: parse_defender_quarantine,
-    }.get(kind)
-    if parser is None:
-        summary.error = f"no parser for kind {kind!r}"
-        return [], summary
-
     items: list[ArtifactItem] = []
     try:
-        for item in parser(content, source):
+        if kind == SQLITE:
+            gen = parse_sqlite(content, source, wal_content=wal_content)
+        elif kind == PST:
+            gen = parse_pst(content, source)
+        elif kind == REGISTRY:
+            gen = parse_registry(content, source)
+        elif kind == ESEDB:
+            gen = parse_esedb(content, source)
+        elif kind == DEFENDER_QUARANTINE:
+            gen = parse_defender_quarantine(content, source)
+        else:
+            summary.error = f"no parser for kind {kind!r}"
+            return [], summary
+        for item in gen:
             items.append(item)
     except Exception as exc:  # noqa: BLE001
         summary.error = f"{type(exc).__name__}: {exc}"

@@ -56,6 +56,10 @@ def glob_segments(first_segment: str) -> list[str]:
     return [str(c) for c in candidates if c.is_file() and pattern.match(c.name)]
 
 
+# Raw / dd image extensions — a flat sector-for-sector dump of a disk.
+_RAW_EXTS = {".dd", ".raw", ".img", ".bin", ".001", ".000", ".ima", ".flp"}
+
+
 def detect_format(first_segment: str) -> str:
     ext = Path(first_segment).suffix.lower()
     if ext.startswith(".ex"):
@@ -67,10 +71,65 @@ def detect_format(first_segment: str) -> str:
     return "E01"
 
 
-def inspect(first_segment: str) -> EwfInfo:
-    """Return metadata about an E01 set. Works even without pyewf —
-    returns segment list, format guess, and size estimate from disk only.
+def _is_ewf_signature(path: str) -> bool:
+    """True if the file begins with an EWF/EWF2/LEWF signature."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+        return head[:3] in (b"EVF", b"LVF") or head[:4] == b"EVF2"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_aff4(path: str) -> bool:
+    """AFF4 v1.0 is a ZIP container; the ZIP comment / first member
+    names carry an 'aff4' marker. Detect cheaply from the first bytes.
     """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(512)
+        if head[:4] != b"PK\x03\x04":
+            return False
+        return b"aff4" in head.lower() or b"container.description" in head.lower()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def inspect(first_segment: str) -> EwfInfo:
+    """Return metadata about a forensic image.
+
+    Handles three input kinds:
+      * EWF / EnCase  (.E01 / .Ex01 / .L01 …)  — full metadata via pyewf
+      * raw / dd      (.dd / .raw / .img / .001 …) — flat disk dump
+      * AFF4          — detected and reported as unsupported
+
+    Works even without pyewf (returns a best-effort estimate).
+    """
+    ext = Path(first_segment).suffix.lower()
+
+    # --- AFF4 — detected, not supported (see note in EwfInfo) ----------
+    if ext == ".aff4" or _is_aff4(first_segment):
+        size = os.path.getsize(first_segment) if os.path.exists(first_segment) else 0
+        return EwfInfo(
+            segment_files=[first_segment], media_size=size,
+            sectors_per_chunk=None, bytes_per_sector=None,
+            md5=None, sha1=None, acquiry_date=None,
+            is_encrypted=False, format="AFF4",
+        )
+
+    # --- raw / dd — a flat image, not EWF ------------------------------
+    is_raw = (ext in _RAW_EXTS or
+              (os.path.isfile(first_segment) and not _is_ewf_signature(first_segment)
+               and ext not in (".e01", ".ex01", ".l01", ".lx01")))
+    if is_raw and os.path.isfile(first_segment):
+        size = os.path.getsize(first_segment)
+        return EwfInfo(
+            segment_files=[first_segment], media_size=size,
+            sectors_per_chunk=None, bytes_per_sector=512,
+            md5=None, sha1=None, acquiry_date=None,
+            is_encrypted=False, format="RAW",
+        )
+
     segs = glob_segments(first_segment)
     fmt = detect_format(first_segment)
     total = sum(os.path.getsize(s) for s in segs) if segs else 0
@@ -193,6 +252,116 @@ class EwfHandle:
             self._handle.close()
         except Exception:
             pass
+
+
+class RawHandle:
+    """File-like wrapper over a flat raw / dd disk image.
+
+    Presents the exact same interface as `EwfHandle` (read / seek /
+    tell / size / get_size / close + context manager) so every layer
+    above — the filesystem walker, encryption/VSS detection, hashing —
+    consumes a raw image and an E01 identically.
+
+    A raw image has no compression and no segments, so this is just a
+    thin, position-tracking view over an ordinary file.
+    """
+
+    def __init__(self, path: str):
+        self.path = str(path)
+        self._fh = open(self.path, "rb")
+        self._fh.seek(0, os.SEEK_END)
+        self._size = self._fh.tell()
+        self._fh.seek(0)
+        self._pos = 0
+        self.segments = [self.path]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def read(self, n: int = -1) -> bytes:
+        if n is None or n < 0:
+            n = self._size - self._pos
+        self._fh.seek(self._pos)
+        data = self._fh.read(n)
+        self._pos += len(data)
+        return data
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 0:
+            self._pos = int(offset)
+        elif whence == 1:
+            self._pos += int(offset)
+        elif whence == 2:
+            self._pos = self._size + int(offset)
+        self._pos = max(0, min(self._pos, self._size))
+        return self._pos
+
+    def tell(self) -> int:
+        return self._pos
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def get_size(self) -> int:
+        return self._size
+
+    def get_offset(self) -> int:
+        return self._pos
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def open_handle(info: "EwfInfo"):
+    """Return the right image handle for an inspected image.
+
+    `EwfInfo.format` is one of E01/Ex01/L01/Lx01 (EWF) or RAW. AFF4 is
+    rejected here — the caller should check for it before ingesting.
+    """
+    if info.format == "RAW":
+        return RawHandle(info.segment_files[0])
+    if info.format == "AFF4":
+        raise RuntimeError(
+            "AFF4 images are not supported by this build — see the README "
+            "(the only Python AFF4 library, pyaff4, has an abandoned "
+            "dependency chain). Convert to E01 or raw/dd first."
+        )
+    return EwfHandle(info.segment_files)
+
+
+def raw_media_hash(path: str, algos: Sequence[str],
+                   block_size: int = 16 * 1024 * 1024,
+                   progress_cb: Optional[Callable[[int, int], None]] = None,
+                   cancel_cb: Optional[Callable[[], bool]] = None
+                   ) -> dict[str, object]:
+    """Hash a raw / dd image — a flat file, no decompression, so a single
+    streaming pass. Same return shape as `parallel_hash`.
+    """
+    size = os.path.getsize(path)
+    hashers = {a: _new_hasher(a) for a in algos}
+    done = 0
+    with open(path, "rb") as fh:
+        while True:
+            if cancel_cb and cancel_cb():
+                raise _Cancelled()
+            chunk = fh.read(block_size)
+            if not chunk:
+                break
+            for h in hashers.values():
+                h.update(chunk)
+            done += len(chunk)
+            if progress_cb:
+                progress_cb(done, size)
+    result: dict[str, object] = {a: h.hexdigest() for a, h in hashers.items()}
+    result["size_bytes"] = size
+    return result
 
 
 # ---- parallel multi-handle hashing ----------------------------------------
