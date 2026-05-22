@@ -1,37 +1,52 @@
-# Core UI
-PySide6>=6.6,<7
+# ==============================================================
+#  E01 Index & Search  —  complete dependency list
+#
+#  Install EVERYTHING in one command:
+#      pip install -r requirements.txt
+#
+#  Offline install (uses the pre-built wheels in ./wheels/,
+#  no Microsoft C++ Build Tools needed):
+#      pip install -r requirements.txt --find-links wheels/
+#
+#  Tested on Windows + Python 3.10 (cp310). The C-extension
+#  packages also have pre-built wheels on PyPI for cp310-cp312.
+# ==============================================================
 
-# Crypto / signing — already installed in user's env
-cryptography>=42
+# ---- GUI ------------------------------------------------------
+PySide6>=6.6,<7                # desktop application framework (Qt 6)
 
-# Indexing — primary. 0.22+ has TextAnalyzerBuilder; 0.25.1 adds fast-field tokenizers.
-# Wheels available for cp310-cp312 on PyPI.
-tantivy>=0.22,<0.26
+# ---- Crypto / signing ----------------------------------------
+cryptography>=42               # Ed25519 signed manifest + AES-GCM at rest
 
-# Encoding
-charset-normalizer>=3.4,<4   # MIT — preferred over chardet 7.x
+# ---- Search index --------------------------------------------
+tantivy>=0.22,<0.26            # full-text search engine (Rust, Lucene-class)
 
-# Fuzzy hashing
-python-tlsh>=4.5             # actively maintained; ssdeep optional/secondary
+# ---- Encoding detection --------------------------------------
+charset-normalizer>=3.4,<4     # per-file text encoding detection
 
-# Forensic stack — wheels exist on PyPI for cp310-cp312 on Windows/Linux/macOS
-# If install fails on Windows, see Deps Status panel in the app for fallback steps.
-libewf-python==20240506      # E01 reader; status: pre-alpha but de-facto standard
-pytsk3>=20230125             # Sleuth Kit binding
+# ---- Fuzzy hashing -------------------------------------------
+python-tlsh                    # TLSH similarity hash ("find similar files")
 
-# Phase 1 — image-access stack (all ship prebuilt cp310 Windows wheels,
-# also bundled in ./wheels/ for offline install).
-libvshadow-python>=20240504  # Volume Shadow Copy (VSS) snapshots
-libbde-python>=20240502      # BitLocker decryption
-libfvde-python>=20240502     # FileVault 2 decryption
-libluksde-python>=20240503   # LUKS decryption
-libfsntfs-python>=20240501   # direct NTFS (TSK fallback)
-libfsapfs-python>=20240429   # direct APFS (TSK fallback)
+# ---- Image access: E01 reader + Sleuth Kit walker -----------
+libewf-python==20240506        # EWF / EnCase .E01 image reader
+pytsk3>=20230125               # The Sleuth Kit filesystem walker
 
-# Phase 2 — content extraction (PyMuPDF + extract-msg; the rest is stdlib)
-pymupdf>=1.24                # PDF text extraction
-extract-msg>=0.50            # Outlook .msg parsing
+# ---- Encrypted / shadowed / direct-filesystem readers -------
+libvshadow-python>=20240504    # Volume Shadow Copy (VSS) snapshots
+libbde-python>=20240502        # BitLocker volume decryption
+libfvde-python>=20240502       # FileVault 2 volume decryption
+libluksde-python>=20240503     # LUKS volume decryption
+libfsntfs-python>=20240501     # direct NTFS reader (TSK fallback)
+libfsapfs-python>=20240429     # direct APFS reader (TSK fallback)
 
-# Optional (later phases):
-# yara-x>=1.0
-# libpff-python
+# ---- Content extraction --------------------------------------
+pymupdf                        # PDF text extraction (PyMuPDF)
+extract-msg                    # Outlook .msg email parser
+
+# ---- Malware / IoC scanning ----------------------------------
+yara-x                         # YARA-X rule scanning
+
+# ---- Specialized artefact parsers ----------------------------
+libpff-python                  # Outlook PST / OST mail stores
+libregf-python>=20240421       # Windows Registry hives
+libesedb-python>=20240420      # ESE databases (Edge / SRUM / Search)
