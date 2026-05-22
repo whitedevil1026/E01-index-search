@@ -6,7 +6,7 @@ re-probes deps when finished so the parent panel can refresh.
 
 For packages that have no published Windows wheel on PyPI (currently
 `pytsk3` and `python-tlsh`), the repo bundles pre-built .whl files in
-`try1/wheels/`. The install command always passes `--find-links` to
+`wheels/`. The install command always passes `--find-links` to
 that directory so pip picks the bundled wheel up automatically — no
 compiler needed.
 """
@@ -27,7 +27,7 @@ from app.core.deps import Dep
 
 # The folder that ships pre-built wheels for the C-extension deps that
 # don't have Windows binaries on PyPI. Resolved relative to the
-# try1/ root (two levels up from this file).
+# project root (two levels up from this file).
 BUNDLED_WHEELS_DIR = (Path(__file__).resolve().parent.parent.parent / "wheels").resolve()
 
 

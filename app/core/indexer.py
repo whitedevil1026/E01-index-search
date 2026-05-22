@@ -33,14 +33,14 @@ except Exception:  # noqa: BLE001
     HAS_TANTIVY = False
 
 
-# For try1 we use Tantivy's built-in `default` analyzer (lowercases +
-# splits on word boundaries) and apply NFC normalization at the
-# application layer in normalize_query() and add_doc(). A bespoke
-# `TextAnalyzerBuilder` analyzer was tried in an earlier revision but
-# the tantivy-py 0.25 API surface for registering custom analyzers is
-# fragile across builds and a silent registration failure produces
+# We use Tantivy's built-in `default` analyzer (lowercases + splits on
+# word boundaries) and apply NFC normalization at the application layer
+# in normalize_query() and add_doc(). A bespoke `TextAnalyzerBuilder`
+# analyzer was tried in an earlier revision but the tantivy-py 0.25 API
+# surface for registering custom analyzers is fragile across builds and
+# a silent registration failure produces
 # `Schema error: 'Error getting tokenizer for field: name'` at commit
-# time. The built-in `default` is good enough for try1; try2 will
+# time. The built-in `default` is sufficient; a future revision may
 # revisit with proper version-pinned analyzer registration.
 
 
@@ -103,7 +103,8 @@ class Indexer:
         doc.add_text("path", path)
         doc.add_text("name", name)
         doc.add_text("body", body_n)
-        # Mirror into body_cjk for try1 — try2 will route via lindera
+        # Mirror into body_cjk for now — a future revision may route
+        # CJK text through a dedicated analyzer (e.g. lindera).
         doc.add_text("body_cjk", body_n)
         doc.add_text("encoding", encoding)
         doc.add_unsigned("size_bytes", max(0, int(size_bytes)))

@@ -557,7 +557,7 @@ class IngestPanel(QWidget):
                     f"  vol{v.index}: key material captured for "
                     f"{enc_mod.human_name(v.encryption)}"
                 )
-                # try1: a single credential set is applied to every
+                # Note: a single credential set is applied to every
                 # encrypted volume during the ingest walk.
                 break
         if self._credentials is None:

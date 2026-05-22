@@ -39,7 +39,7 @@ def _probe(module_name: str, purpose: str, pip_args: list[str],
 
 
 # Note for the C-extension packages (`pytsk3`, `python-tlsh`).
-# We ship pre-built wheels for Python 3.10/win_amd64 in `try1/wheels/`,
+# We ship pre-built wheels for Python 3.10/win_amd64 in `wheels/`,
 # so the typical user installs them from the bundle with no compiler.
 # The MSVC fallback only matters if a user runs a Python version we
 # haven't pre-built for.
