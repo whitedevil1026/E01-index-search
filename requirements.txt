@@ -13,7 +13,11 @@
 # ==============================================================
 
 # ---- GUI ------------------------------------------------------
-PySide6>=6.6,<7                # desktop application framework (Qt 6)
+# Use Essentials (Core/Gui/Widgets/etc.). The full PySide6 metapackage
+# also pulls in PySide6-Addons (~170 MB, multimedia/charts/web), which
+# this app does not use. Skipping Addons keeps install fast and the
+# offline wheel bundle small.
+PySide6-Essentials>=6.6,<7
 
 # ---- Crypto / signing ----------------------------------------
 cryptography>=42               # Ed25519 signed manifest + AES-GCM at rest

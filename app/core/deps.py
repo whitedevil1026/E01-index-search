@@ -67,7 +67,7 @@ def _c_ext_note() -> str:
 
 def probe_all() -> list[Dep]:
     return [
-        _probe("PySide6", "Desktop GUI framework", ["PySide6>=6.6,<7"]),
+        _probe("PySide6", "Desktop GUI framework", ["PySide6-Essentials>=6.6,<7"]),
         _probe("cryptography",
                "Ed25519 manifest signing + AES-GCM at-rest",
                ["cryptography>=42"]),

@@ -31,12 +31,19 @@ pip install -r requirements.txt
 `requirements.txt` contains **every** dependency, so that single
 `pip install -r` command installs the whole tool.
 
-To install **offline** — using the pre-built wheels bundled in
-[`wheels/`](wheels/), with no C++ compiler needed:
+### Fully offline install (no internet, no compiler)
+
+Every dependency — including all transitive dependencies — is bundled
+as a pre-built wheel in [`wheels/`](wheels/). To install the tool
+without touching the network at all:
 
 ```
-pip install -r requirements.txt --find-links wheels/
+pip install -r requirements.txt --find-links wheels/ --no-index
 ```
+
+The `--no-index` flag tells pip to ignore PyPI and use only the
+bundled wheels. This works on a fresh Windows + Python 3.10 machine
+with no internet and no Microsoft C++ Build Tools.
 
 ---
 
@@ -91,11 +98,12 @@ Tools**. pip output streams live in the dialog.
 ### Option B — pip on the command line
 
 ```
-pip install -r requirements.txt --find-links wheels/
+pip install -r requirements.txt --find-links wheels/ --no-index
 ```
 
-The `--find-links wheels/` part makes pip use the bundled offline
-wheels; drop it to fetch everything from PyPI instead.
+Adding `--no-index` makes pip use only the bundled wheels (no network).
+Drop `--no-index` to let pip mix bundled wheels with PyPI; drop both
+flags to fetch everything from PyPI.
 
 ### Option C — install one package at a time
 
@@ -122,7 +130,7 @@ Everything is in [`requirements.txt`](requirements.txt). Summary:
 
 | Package | Used for |
 |---|---|
-| `PySide6` | Desktop GUI (Qt 6) |
+| `PySide6-Essentials` | Desktop GUI (Qt 6 Core / Gui / Widgets) |
 | `cryptography` | Ed25519 signed manifest, AES-GCM encryption at rest |
 | `tantivy` | Full-text search index |
 | `charset-normalizer` | Text encoding detection |
@@ -142,9 +150,11 @@ Everything is in [`requirements.txt`](requirements.txt). Summary:
 | `libregf-python` | Windows Registry hives |
 | `libesedb-python` | ESE databases (Edge / SRUM / Windows Search) |
 
-The eleven C-extension packages (`pytsk3`, `python-tlsh` and the
-`lib*-python` family) ship as pre-built **cp310** wheels in
-[`wheels/`](wheels/) for offline, compiler-free installation.
+**Every** dependency above — plus all transitive dependencies — ships
+as a pre-built **cp310 / win_amd64** wheel in [`wheels/`](wheels/)
+(~115 MB, 40 wheels). A fully air-gapped Windows + Python 3.10
+install with `--no-index` works out of the box: no internet, no
+Microsoft C++ Build Tools.
 
 ---
 
