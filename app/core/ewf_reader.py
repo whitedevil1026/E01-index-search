@@ -117,6 +117,23 @@ def inspect(first_segment: str) -> EwfInfo:
             is_encrypted=False, format="AFF4",
         )
 
+    # --- an EWF extension that is not actually EWF ---------------------
+    # Extension and content disagree. This is not hypothetical: several
+    # ordinary system and driver files reuse `.e01`-style extensions, so
+    # a folder scan for "*.E01" turns up files that are not evidence at
+    # all. Reporting them as E01 and letting libewf fail deep inside the
+    # walk produces a confusing error much later; say so up front.
+    if (ext in (".e01", ".ex01", ".l01", ".lx01")
+            and os.path.isfile(first_segment)
+            and not _is_ewf_signature(first_segment)):
+        size = os.path.getsize(first_segment)
+        return EwfInfo(
+            segment_files=[first_segment], media_size=size,
+            sectors_per_chunk=None, bytes_per_sector=None,
+            md5=None, sha1=None, acquiry_date=None,
+            is_encrypted=False, format="UNKNOWN",
+        )
+
     # --- raw / dd — a flat image, not EWF ------------------------------
     is_raw = (ext in _RAW_EXTS or
               (os.path.isfile(first_segment) and not _is_ewf_signature(first_segment)
@@ -209,11 +226,25 @@ class EwfHandle:
     def read(self, n: int = -1) -> bytes:
         if n < 0:
             n = self._size - self._pos
-        data = self._handle.read(n)
+        # Read until n bytes are gathered or the media genuinely ends.
+        # A single pyewf read can come up short (chunk boundary, a
+        # damaged segment, an ewfrecover-rebuilt image). Callers above
+        # assume a full buffer: parallel_hash would hash fewer bytes and
+        # silently emit a WRONG digest, and the raw sweep would step
+        # over the missing bytes. Both are silent evidence loss, so the
+        # fill happens here, once, for every consumer.
+        parts: list[bytes] = []
+        got = 0
+        while got < n:
+            chunk = self._handle.read(n - got)
+            if not chunk:
+                break
+            parts.append(chunk)
+            got += len(chunk)
         # Track position ourselves — pyewf.read() returns the bytes but
         # we maintain our own offset for tell()/seek() bookkeeping.
-        self._pos += len(data)
-        return data
+        self._pos += got
+        return parts[0] if len(parts) == 1 else b"".join(parts)
 
     def seek(self, offset: int, whence: int = 0) -> int:
         # IMPORTANT: pyewf.handle.seek() returns None on success, not the
@@ -285,9 +316,19 @@ class RawHandle:
         if n is None or n < 0:
             n = self._size - self._pos
         self._fh.seek(self._pos)
-        data = self._fh.read(n)
-        self._pos += len(data)
-        return data
+        # Same full-buffer contract as EwfHandle.read — see the note
+        # there. On a network or removable volume a single read can
+        # return short without being at end-of-file.
+        parts: list[bytes] = []
+        got = 0
+        while got < n:
+            chunk = self._fh.read(n - got)
+            if not chunk:
+                break
+            parts.append(chunk)
+            got += len(chunk)
+        self._pos += got
+        return parts[0] if len(parts) == 1 else b"".join(parts)
 
     def seek(self, offset: int, whence: int = 0) -> int:
         if whence == 0:
@@ -332,6 +373,13 @@ def open_handle(info: "EwfInfo"):
             "AFF4 images are not supported by this build — see the README "
             "(the only Python AFF4 library, pyaff4, has an abandoned "
             "dependency chain). Convert to E01 or raw/dd first."
+        )
+    if info.format == "UNKNOWN":
+        raise RuntimeError(
+            "This file has an EWF extension but does not start with an EWF "
+            "signature, so it is not an E01/Ex01/L01 image. Check that the "
+            "correct file was selected — some non-evidence files reuse "
+            "these extensions."
         )
     return EwfHandle(info.segment_files)
 
@@ -430,7 +478,24 @@ def parallel_hash(segments: Sequence[str], algos: Sequence[str],
         n = min(block_size, size - off)
         h = _handle()
         h.seek(off, 0)
-        return h.read(n)
+        parts: list[bytes] = []
+        got = 0
+        while got < n:
+            chunk = h.read(n - got)
+            if not chunk:
+                break
+            parts.append(chunk)
+            got += len(chunk)
+        if got != n:
+            # Hashing a short block would produce a plausible-looking
+            # but WRONG digest. For evidence that is the one failure
+            # mode we must never ship quietly.
+            raise IOError(
+                f"short read hashing evidence at offset {off:#x}: "
+                f"expected {n} bytes, got {got}. The image may be "
+                f"damaged or a segment file may be missing."
+            )
+        return parts[0] if len(parts) == 1 else b"".join(parts)
 
     hashers = {a: _new_hasher(a) for a in algos}
     done = 0

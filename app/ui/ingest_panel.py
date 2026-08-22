@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import io
+import os
 import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
+    QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QScrollArea, QSpinBox, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
@@ -20,11 +21,16 @@ from app.core.ewf_reader import (
 from app.core.filesystem import walk_image, scan_volumes, HAS_PYTSK3
 from app.core.hashing import hash_stream
 from app.core.hash_policy import HashPolicy
-from app.core.indexer import HAS_TANTIVY, Indexer
+from app.core.indexer import HAS_TANTIVY, Indexer, stable_doc_id
 from app.core.text_extract import extract_text, MAX_TEXT_CHARS
 from app.core.worker import Worker
 from app.core import encryption as enc_mod
-from app.core.raw_scan import raw_string_sweep
+from app.core.raw_scan import (
+    raw_string_sweep, sweep_and_carve, parallel_string_sweep,
+)
+from app.core.encodings import (
+    DEFAULT_ENCODING_SET, ENCODING_SET_LABELS, ENCODING_SETS,
+)
 from app.core import patterns as pat_mod
 from app.core.carver import carve_stream
 from app.core.hashing import hash_bytes
@@ -44,8 +50,9 @@ class IngestPanel(QWidget):
         super().__init__(parent)
         self.case = None
         self._worker: Worker | None = None
-        # Credentials collected by Scan Volumes for any encrypted volume.
-        self._credentials = None
+        # {volume_index: Credentials} collected by Scan Volumes for the
+        # encrypted volumes the examiner supplied keys for.
+        self._credentials: dict | None = None
         self._scanned_volumes: list = []
         # Examiner-supplied YARA rule files (compiled alongside built-ins).
         self._yara_rule_files: list = []
@@ -358,6 +365,71 @@ class IngestPanel(QWidget):
         for cb in (self.chk_raw_strings, self.chk_raw_patterns,
                    self.chk_carve):
             rl.addWidget(cb)
+
+        # Encoding-set selector. Each extra encoding is a real cost on a
+        # large image, and the CJK code pages rarely earn it unless the
+        # case involves CJK content — so it is a per-case decision.
+        enc_row = QHBoxLayout()
+        enc_row.addSpacing(22)
+        enc_row.addWidget(QLabel("Encodings to sweep:"))
+        self.cmb_encodings = QComboBox()
+        for key in ("ascii_utf16", "windows", "full"):
+            self.cmb_encodings.addItem(ENCODING_SET_LABELS[key], key)
+        self.cmb_encodings.setCurrentIndex(
+            self.cmb_encodings.findData(DEFAULT_ENCODING_SET))
+        self.cmb_encodings.setToolTip(
+            "Which character encodings the raw sweep extracts text under.\n\n"
+            "Raw bytes carry no charset, so the sweep decodes each page "
+            "under every selected encoding rather than guessing one.\n\n"
+            "ASCII + UTF-16 — fastest; still catches Windows filenames and "
+            "most document text, which are UTF-16LE.\n"
+            "Windows / Western — adds UTF-8 and cp1252. Recommended default.\n"
+            "Full incl. CJK — adds Shift-JIS, GBK, Korean and Big5. Roughly "
+            "3x slower than ASCII+UTF-16; pick it when the case may involve "
+            "Japanese, Chinese or Korean content."
+        )
+        enc_row.addWidget(self.cmb_encodings)
+        enc_row.addSpacing(24)
+        enc_row.addWidget(QLabel("Sweep workers:"))
+        self.spin_workers = QSpinBox()
+        self.spin_workers.setRange(1, 32)
+        self.spin_workers.setValue(min(4, os.cpu_count() or 1))
+        self.spin_workers.setToolTip(
+            "How many processes scan the image in parallel.\n\n"
+            "The string sweep is the slowest stage and its cost is regex "
+            "matching, which in Python cannot be shared across threads — "
+            "so separate processes are used, each with its own image "
+            "handle.\n\n"
+            "Results are consumed in image order, so the output is "
+            "identical to a single-process run; only the wall clock "
+            "changes. Measured ~3x faster on 8 logical CPUs.\n\n"
+            "Set to 1 to run in this process (also the automatic "
+            "fallback if processes cannot be started)."
+        )
+        enc_row.addWidget(self.spin_workers)
+        enc_row.addStretch(1)
+        rl.addLayout(enc_row)
+
+        # Optional single-pass mode — off by default so the standard
+        # behaviour stays the simple, independently verifiable one.
+        self.chk_single_pass = QCheckBox(
+            "Single-pass raw scan — run the sweep and carving off one read "
+            "of the image (faster on large images)"
+        )
+        self.chk_single_pass.setToolTip(
+            "By default the string sweep and the carver each read the whole "
+            "image separately. This option reads it once and feeds both, "
+            "saving roughly one full decompression pass — about 20 minutes "
+            "per 100 GB.\n\n"
+            "TRADE-OFF: a shared read is inherently sequential, so this "
+            "turns OFF the parallel sweep. On a multi-core machine the "
+            "parallel sweep usually wins by more than the saved read — "
+            "measured on the sample image, 44s parallel vs 69s single-pass. "
+            "Prefer this only when disk throughput, not CPU, is the limit.\n\n"
+            "Results are identical either way; the carved files and the "
+            "swept pages are verified to match the separate passes exactly."
+        )
+        rl.addWidget(self.chk_single_pass)
         # YARA row — checkbox + custom-rule loader
         yara_row = QHBoxLayout()
         yara_row.addWidget(self.chk_yara)
@@ -405,6 +477,12 @@ class IngestPanel(QWidget):
         self.progress.setFormat("Files enumerated: %v / %m   (%p%)")
         self.progress.setMinimumHeight(20)
         ol.addWidget(self.progress)
+
+        # Elapsed / remaining. A 100 GB ingest runs for hours, so the
+        # examiner needs to know whether to wait or come back later.
+        self.lbl_eta = QLabel("")
+        self.lbl_eta.setObjectName("muted")
+        ol.addWidget(self.lbl_eta)
 
         log_label = QLabel("Ingest log")
         log_label.setObjectName("h2")
@@ -542,7 +620,9 @@ class IngestPanel(QWidget):
                      "VSS snapshots, if any, are shown in the log.")
             return
 
-        # collect credentials for the encrypted volume(s)
+        # Collect credentials per encrypted volume — a disk can carry
+        # several volumes under different keys, so one prompt each.
+        per_volume: dict[int, enc_mod.Credentials] = {}
         for v in enc_found:
             dlg = EncryptionKeyDialog(self, kind=v.encryption,
                                       volume_label=f"vol{v.index}")
@@ -552,14 +632,17 @@ class IngestPanel(QWidget):
                 continue
             creds = dlg.credentials()
             if not creds.is_empty():
-                self._credentials = creds
+                per_volume[v.index] = creds
                 self._append_log(
                     f"  vol{v.index}: key material captured for "
                     f"{enc_mod.human_name(v.encryption)}"
                 )
-                # Note: a single credential set is applied to every
-                # encrypted volume during the ingest walk.
-                break
+        if per_volume:
+            self._credentials = per_volume
+            self._append_log(
+                f"  keys held for {len(per_volume)} of {len(enc_found)} "
+                f"encrypted volume(s)"
+            )
         if self._credentials is None:
             msg_warn(self, "No keys captured",
                      "No key material was entered. Encrypted volumes will be "
@@ -776,6 +859,18 @@ class IngestPanel(QWidget):
                      "(dd) and re-open it.")
             self.btn_compute.setEnabled(False)
             return
+        if info.format == "UNKNOWN":
+            self._append_log("[warn] EWF extension but no EWF signature — "
+                             "this file is not a forensic image.")
+            msg_warn(self, "Not an EWF image",
+                     "This file has an .E01/.Ex01/.L01 extension but does "
+                     "not begin with an EWF signature, so it is not a "
+                     "forensic image.\n\nSome ordinary system and driver "
+                     "files reuse these extensions, so a folder search by "
+                     "extension can turn them up.\n\nCheck that the correct "
+                     "file was selected.")
+            self.btn_compute.setEnabled(False)
+            return
         if info.format == "RAW":
             self._append_log(f"[ok] raw/dd image — {info.media_size:,} bytes "
                              "(flat disk dump, no EWF metadata)")
@@ -802,11 +897,23 @@ class IngestPanel(QWidget):
 
     def _raw_scan_pass(self, w, case, ev_id, evidence_uuid, segs,
                        indexer, writer, do_raw_strings, do_raw_patterns,
-                       do_carve, do_yara) -> dict:
+                       do_carve, do_yara,
+                       enc_set: str = DEFAULT_ENCODING_SET,
+                       single_pass: bool = False,
+                       sweep_workers: int = 1) -> dict:
         """Run the raw byte-level scans after the filesystem walk.
         Returns a summary dict. Runs inside the ingest Worker thread.
+
+        enc_set      — encoding preset name for the string sweep.
+        single_pass  — feed the sweep and the carver from one read of
+                       the image instead of one read each.
+        sweep_workers — processes for the string sweep; 1 runs it here.
+                       Ignored in single_pass mode, which is inherently
+                       one sequential read.
         """
         summary: dict = {}
+        encodings = ENCODING_SETS.get(enc_set, ENCODING_SETS[DEFAULT_ENCODING_SET])
+        w.log.emit(f"  encodings: {enc_set} -> {', '.join(encodings)}")
 
         yara_scanner = None
         if do_yara and YaraScanner is not None:
@@ -829,11 +936,32 @@ class IngestPanel(QWidget):
         IOC_DISTINCT_CAP = 500_000
         ioc_distinct: dict = {}
 
-        if do_raw_strings or do_raw_patterns:
+        do_sweep = do_raw_strings or do_raw_patterns
+        carve_active = do_carve or do_yara
+        # Both the sweep and the carver read the whole image. When the
+        # examiner opts into single-pass mode and both are running, they
+        # are driven from one shared read instead of one each.
+        combined = single_pass and do_sweep and carve_active
+        if combined:
+            w.log.emit("  single-pass mode: sweep + carving share one "
+                       "read of the image")
+            if sweep_workers > 1:
+                w.log.emit(f"  [note] single-pass is sequential, so the "
+                           f"{sweep_workers} sweep workers are not used")
+
+        if do_sweep:
             counters = {"raw_docs": 0, "pat": 0}
             pat_totals: dict = {}
 
-            def on_page(page, text, n_strings):
+            def on_page(page, text, n_strings, hits=None):
+                """Index one swept page.
+
+                `hits` is supplied already computed by the parallel
+                sweep (the workers scan patterns where the text is
+                already in hand); the sequential path passes None and
+                the patterns are scanned here. Either way the ordering
+                and the recorded first-seen offsets are identical.
+                """
                 if w.cancelled:
                     return
                 body_parts = []
@@ -843,24 +971,27 @@ class IngestPanel(QWidget):
                     # Patterns are scanned over the *extracted text*, not
                     # the raw bytes — ~10x less data and no regex
                     # backtracking on binary noise.
-                    phits = pat_mod.scan_text(text)
+                    if hits is None:
+                        phits = [(p.kind, p.value, p.offset)
+                                 for p in pat_mod.scan_text(text)]
+                    else:
+                        phits = hits
                     if phits:
                         counters["pat"] += len(phits)
-                        for ph in phits:
-                            pat_totals[ph.kind] = pat_totals.get(ph.kind, 0) + 1
-                            key = (ph.kind, ph.value)
+                        for kind, value, _off in phits:
+                            pat_totals[kind] = pat_totals.get(kind, 0) + 1
+                            key = (kind, value)
                             slot = ioc_distinct.get(key)
                             if slot is not None:
                                 slot[0] += 1
                             elif len(ioc_distinct) < IOC_DISTINCT_CAP:
                                 ioc_distinct[key] = [1, page.offset]
                         body_parts.append("\n".join(
-                            f"{p.kind}: {p.value}" for p in phits))
+                            f"{k}: {v}" for k, v, _ in phits))
                 if body_parts and writer is not None and indexer is not None:
                     indexer.add_doc(
                         writer,
-                        case_doc_id=hash((ev_id, "raw", page.offset))
-                        & 0x7FFFFFFFFFFFFFFF,
+                        case_doc_id=stable_doc_id(ev_id, "raw", page.offset),
                         path=f"/(raw)/{page.offset:#x}",
                         name=f"raw@{page.offset:#x}",
                         body="\n".join(body_parts),
@@ -869,13 +1000,9 @@ class IngestPanel(QWidget):
                     )
                     counters["raw_docs"] += 1
 
-            try:
-                with open_handle(self._info) as rh:
-                    stats = raw_string_sweep(
-                        rh, on_page=on_page,
-                        progress_cb=lambda d, t: w.progress.emit(d, t, ""),
-                        cancel_cb=lambda: w.cancelled,
-                    )
+            def report_sweep(stats):
+                """Log + persist the sweep results. Shared by both the
+                separate-pass and single-pass routes."""
                 w.log.emit(
                     f"  raw sweep: {stats.pages} pages, "
                     f"{stats.bytes_scanned:,} bytes, {stats.strings:,} "
@@ -888,7 +1015,10 @@ class IngestPanel(QWidget):
                     w.log.emit(f"  IoC patterns: {counters['pat']:,} hits  {top}")
                     summary["patterns"] = counters["pat"]
                     case.log("ingest.raw_patterns",
-                             {"total": counters["pat"], "by_kind": pat_totals})
+                             {"total": counters["pat"], "by_kind": pat_totals,
+                              "encoding_set": enc_set,
+                              "encodings": list(encodings),
+                              "single_pass": combined})
                     # persist distinct indicators to the findings table
                     if ioc_distinct:
                         finding_rows = [
@@ -900,11 +1030,50 @@ class IngestPanel(QWidget):
                         w.log.emit(f"  stored {len(finding_rows):,} distinct "
                                    f"IoC indicators to findings")
                         summary["distinct_iocs"] = len(finding_rows)
-            except Exception as exc:  # noqa: BLE001
-                w.log.emit(f"  [error] raw sweep failed: {exc}")
+
+            if not combined:
+                stats = None
+                if sweep_workers > 1:
+                    # Fan the page scans out across processes. Results are
+                    # consumed in offset order, so the output matches a
+                    # sequential sweep exactly.
+                    try:
+                        w.log.emit(f"  parallel sweep: {sweep_workers} worker "
+                                   f"process(es)")
+                        stats = parallel_string_sweep(
+                            self._info.segment_files, self._info.format,
+                            self._info.media_size,
+                            encodings=encodings, n_workers=sweep_workers,
+                            scan_patterns=do_raw_patterns,
+                            on_result=on_page,
+                            progress_cb=lambda d, t: w.progress.emit(d, t, ""),
+                            cancel_cb=lambda: w.cancelled,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        # Spawning can fail (locked-down host, frozen
+                        # build). Losing the pass would be far worse than
+                        # running it slowly, so fall back.
+                        w.log.emit(f"  [warn] parallel sweep unavailable "
+                                   f"({exc}); falling back to single process")
+                        stats = None
+                        counters["raw_docs"] = 0
+                        counters["pat"] = 0
+                        pat_totals.clear()
+                        ioc_distinct.clear()
+                if stats is None:
+                    try:
+                        with open_handle(self._info) as rh:
+                            stats = raw_string_sweep(
+                                rh, encodings=encodings, on_page=on_page,
+                                progress_cb=lambda d, t: w.progress.emit(d, t, ""),
+                                cancel_cb=lambda: w.cancelled,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        w.log.emit(f"  [error] raw sweep failed: {exc}")
+                if stats is not None:
+                    report_sweep(stats)
 
         # ---- file carving (+ YARA on carved files) --------------------
-        carve_active = do_carve or do_yara
         if carve_active and not w.cancelled:
             carved_rows: list = []
             counts = {"carved": 0, "yara": 0}
@@ -933,6 +1102,9 @@ class IngestPanel(QWidget):
                     "size_bytes": cf.size, "is_allocated": False,
                     "md5": hashes["md5"], "sha256": hashes["sha256"],
                     "tlsh": hashes["tlsh"],
+                    # Absolute image offset — this is what makes a carved
+                    # file re-extractable later.
+                    "data_offset": cf.offset,
                 }
                 carved_rows.append(row)
                 counts["carved"] += 1
@@ -942,8 +1114,7 @@ class IngestPanel(QWidget):
                         body += "\nYARA: " + " ".join(yara_tags)
                     indexer.add_doc(
                         writer,
-                        case_doc_id=hash((ev_id, "carved", cf.offset))
-                        & 0x7FFFFFFFFFFFFFFF,
+                        case_doc_id=stable_doc_id(ev_id, "carved", cf.offset),
                         path=row["path"], name=row["name"], body=body,
                         encoding="binary", size_bytes=cf.size,
                         sha256=hashes["sha256"] or "",
@@ -955,12 +1126,25 @@ class IngestPanel(QWidget):
                     carved_rows.clear()
 
             try:
-                with open_handle(self._info) as ch:
-                    cstats = carve_stream(
-                        ch, max_files=100000, on_file=on_carved,
-                        progress_cb=lambda d, t: w.progress.emit(d, t, ""),
-                        cancel_cb=lambda: w.cancelled,
-                    )
+                if combined:
+                    # One read drives the sweep and the carver. Both keep
+                    # their own geometry, so results match the separate
+                    # passes exactly.
+                    with open_handle(self._info) as ch:
+                        sstats, cstats = sweep_and_carve(
+                            ch, encodings=encodings, max_files=100000,
+                            on_page=on_page, on_file=on_carved,
+                            progress_cb=lambda d, t: w.progress.emit(d, t, ""),
+                            cancel_cb=lambda: w.cancelled,
+                        )
+                    report_sweep(sstats)
+                else:
+                    with open_handle(self._info) as ch:
+                        cstats = carve_stream(
+                            ch, max_files=100000, on_file=on_carved,
+                            progress_cb=lambda d, t: w.progress.emit(d, t, ""),
+                            cancel_cb=lambda: w.cancelled,
+                        )
                 if carved_rows:
                     case.add_files(ev_id, carved_rows)
                 w.log.emit(f"  carved {cstats.carved} files  "
@@ -997,6 +1181,12 @@ class IngestPanel(QWidget):
             msg_warn(self, "AFF4 not supported",
                      "AFF4 images cannot be ingested by this build. "
                      "Convert the image to E01 or raw/dd first.")
+            return
+        if self._info.format == "UNKNOWN":
+            msg_warn(self, "Not an EWF image",
+                     "This file has an EWF extension but no EWF signature, "
+                     "so it cannot be ingested as evidence. Check that the "
+                     "correct file was selected.")
             return
         if self._info.is_encrypted:
             ret = msg_question(
@@ -1041,6 +1231,9 @@ class IngestPanel(QWidget):
         do_raw_patterns = self.chk_raw_patterns.isChecked()
         do_carve = self.chk_carve.isChecked()
         do_yara = self.chk_yara.isChecked() and HAS_YARA_X
+        enc_set = self.cmb_encodings.currentData() or DEFAULT_ENCODING_SET
+        single_pass = self.chk_single_pass.isChecked()
+        sweep_workers = self.spin_workers.value()
         # Content mode buffers up to ~1 MB of text per doc in the Tantivy
         # writer, so commit more often and give the writer a bigger heap.
         commit_every = 2000 if do_content else 5000
@@ -1049,13 +1242,43 @@ class IngestPanel(QWidget):
         first = segs[0] if segs else self.path_edit.text().strip()
 
         def task(w: Worker) -> tuple[bool, str]:
+            # An ingest can run for hours. If it dies partway (bad
+            # partition, unreadable sector, corrupt container) the docs
+            # already added must still be committed, or every uncommitted
+            # doc since the last checkpoint is silently lost.
+            state: dict = {"writer": None, "committed": False}
+            try:
+                return _ingest(w, state)
+            finally:
+                wr = state.get("writer")
+                if wr is not None:
+                    if not state.get("committed"):
+                        try:
+                            wr.commit()
+                            w.log.emit("[warn] ingest ended early — "
+                                       "committed the partial index")
+                        except Exception as exc:  # noqa: BLE001
+                            w.log.emit(f"[warn] could not commit partial "
+                                       f"index: {exc}")
+                    # Settle background merges before returning, so the
+                    # index directory stops changing under any manifest
+                    # the examiner signs next.
+                    try:
+                        Indexer.finalize(wr)
+                    except Exception as exc:  # noqa: BLE001
+                        w.log.emit(f"[warn] index merge wait failed: {exc}")
+                    state["writer"] = None
+
+        def _ingest(w: Worker, state: dict) -> tuple[bool, str]:
             w.log.emit(f"Registering evidence: {first}")
             if do_content:
                 w.log.emit(f"Content extraction ON (max {max_content_bytes // (1024*1024)} MB/file)")
             if do_vss:
                 w.log.emit(f"VSS snapshots ON (dedup={'on' if do_vss_dedup else 'off'})")
             if credentials is not None:
-                w.log.emit("Encryption keys loaded — encrypted volumes will be unlocked")
+                n_keys = len(credentials) if isinstance(credentials, dict) else 1
+                w.log.emit(f"Encryption keys loaded for {n_keys} volume(s) — "
+                           f"those volumes will be unlocked")
             ev_id = case.add_evidence(
                 path=first, fmt=info.format, size=info.media_size,
                 md5=info.md5, sha256=None,
@@ -1078,6 +1301,7 @@ class IngestPanel(QWidget):
                 try:
                     indexer = Indexer(case.index_dir / f"ev_{ev_id}")
                     writer = indexer.writer(heap_mb=heap_mb)
+                    state["writer"] = writer
                 except Exception as exc:  # noqa: BLE001
                     w.log.emit(f"[warn] indexer init failed: {exc}")
                     indexer = None
@@ -1162,9 +1386,8 @@ class IngestPanel(QWidget):
                                 for it in items:
                                     indexer.add_doc(
                                         writer,
-                                        case_doc_id=hash((ev_id, rec.path,
-                                                          it.subpath))
-                                        & 0x7FFFFFFFFFFFFFFF,
+                                        case_doc_id=stable_doc_id(ev_id, rec.path,
+                                                                  it.subpath),
                                         path=f"{rec.path}#{it.subpath}",
                                         name=it.name,
                                         body=f"{it.name}\n{it.text}",
@@ -1183,9 +1406,8 @@ class IngestPanel(QWidget):
                             for it in items:
                                 indexer.add_doc(
                                     writer,
-                                    case_doc_id=hash((ev_id, rec.path,
-                                                      it.subpath))
-                                    & 0x7FFFFFFFFFFFFFFF,
+                                    case_doc_id=stable_doc_id(ev_id, rec.path,
+                                                              it.subpath),
                                     path=f"{rec.path}#{it.subpath}",
                                     name=it.name,
                                     body=f"{it.name}\n{it.text}",
@@ -1230,6 +1452,10 @@ class IngestPanel(QWidget):
                         "ads_name": rec.ads_name,
                         "vss_snapshot_id": rec.vss_snapshot_id,
                         "md5": md5, "sha256": sha256, "tlsh": tlsh,
+                        # Provenance for a later export back out of the image.
+                        "volume_offset": rec.volume_offset,
+                        "volume_label": rec.volume_label,
+                        "fs_backend": rec.fs_backend,
                     }
                     buf.append(row)
 
@@ -1237,7 +1463,7 @@ class IngestPanel(QWidget):
                     if writer is not None:
                         indexer.add_doc(
                             writer,
-                            case_doc_id=hash((ev_id, rec.path)) & 0x7FFFFFFFFFFFFFFF,
+                            case_doc_id=stable_doc_id(ev_id, rec.path),
                             path=rec.path, name=rec.name,
                             body=body_text,
                             encoding="utf-8",
@@ -1295,8 +1521,7 @@ class IngestPanel(QWidget):
                     for it in items:
                         indexer.add_doc(
                             writer,
-                            case_doc_id=hash((ev_id, db_path, it.subpath))
-                            & 0x7FFFFFFFFFFFFFFF,
+                            case_doc_id=stable_doc_id(ev_id, db_path, it.subpath),
                             path=f"{db_path}#{it.subpath}",
                             name=it.name,
                             body=f"{it.name}\n{it.text}",
@@ -1348,6 +1573,8 @@ class IngestPanel(QWidget):
                 raw_summary = self._raw_scan_pass(
                     w, case, ev_id, evidence_uuid, segs, indexer, writer,
                     do_raw_strings, do_raw_patterns, do_carve, do_yara,
+                    enc_set=enc_set, single_pass=single_pass,
+                    sweep_workers=sweep_workers,
                 )
                 if writer is not None:
                     writer.commit()
@@ -1391,6 +1618,7 @@ class IngestPanel(QWidget):
                     summary += f", {raw_summary['yara']} YARA matches"
             if w.cancelled:
                 summary += " (cancelled)"
+            state["committed"] = True
             return True, summary
 
         self._start_worker(task, total_hint=max_files or 0)
@@ -1398,6 +1626,8 @@ class IngestPanel(QWidget):
     def _start_worker(self, fn, total_hint: int):
         self.progress.setRange(0, total_hint if total_hint > 0 else 0)
         self.progress.setValue(0)
+        self._run_started = time.time()
+        self.lbl_eta.setText("elapsed 0s")
         self.btn_run.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         w = Worker(fn, self)
@@ -1412,12 +1642,53 @@ class IngestPanel(QWidget):
         if total and self.progress.maximum() != total:
             self.progress.setRange(0, total)
         self.progress.setValue(cur)
+        self._update_eta(cur, total)
         if msg:
             self._append_log(msg)
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}h {m:02d}m"
+        if m:
+            return f"{m}m {s:02d}s"
+        return f"{s}s"
+
+    def _update_eta(self, cur: int, total: int) -> None:
+        """Show elapsed time and a remaining estimate.
+
+        The estimate is a straight linear extrapolation of the current
+        stage's rate. Stages differ in speed (the string sweep is far
+        slower than hashing), so it is labelled as an estimate for the
+        stage in progress rather than presented as a countdown for the
+        whole ingest.
+        """
+        t0 = getattr(self, "_run_started", None)
+        if t0 is None:
+            return
+        elapsed = time.time() - t0
+        parts = [f"elapsed {self._fmt_duration(elapsed)}"]
+        if total and cur > 0 and elapsed > 2:
+            rate = cur / elapsed
+            if rate > 0:
+                remaining = max(0, total - cur) / rate
+                parts.append(f"about {self._fmt_duration(remaining)} left "
+                             f"in this stage")
+            done_pct = 100.0 * cur / total
+            parts.append(f"{done_pct:.0f}% of stage")
+        self.lbl_eta.setText("   •   ".join(parts))
 
     def _on_done(self, ok: bool, msg: str):
         self.btn_run.setEnabled(True)
         self.btn_cancel.setEnabled(False)
+        t0 = getattr(self, "_run_started", None)
+        if t0 is not None:
+            took = self._fmt_duration(time.time() - t0)
+            self.lbl_eta.setText(f"finished in {took}")
+            msg = f"{msg}  (took {took})"
         self._append_log(("[ok] " if ok else "[fail] ") + msg)
         mw = self.window()
         if hasattr(mw, "case_panel"):

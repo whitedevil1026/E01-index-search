@@ -69,3 +69,6 @@ desktop.ini
 # But DO commit the bundled wheels — they're the whole point of wheels/
 !wheels/
 !wheels/*.whl
+
+# Scratch cases written by tools/test_ingest_suite.py
+_suite_work/

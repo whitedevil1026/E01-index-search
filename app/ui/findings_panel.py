@@ -19,11 +19,14 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QGuiApplication
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QPushButton, QScrollArea, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget,
+    QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QPushButton, QScrollArea, QSpinBox, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from app.core.csv_safe import csv_safe_row
+from app.core import extract as extract_mod
+from app.ui.centered_msg import msg_error
 from app.ui.exported_dialog import ExportedDialog
 
 
@@ -43,6 +46,7 @@ class FindingsPanel(QWidget):
         super().__init__(parent)
         self.case = None
         self._rows: list[dict] = []
+        self._total = 0          # matches available, before the row cap
         self._mode = "ioc"
 
         outer = QVBoxLayout(self)
@@ -94,6 +98,19 @@ class FindingsPanel(QWidget):
         self.ed_search.returnPressed.connect(self.refresh)
         bar.addWidget(self.ed_search, 1)
 
+        bar.addWidget(QLabel("Rows:"))
+        self.spin_limit = QSpinBox()
+        self.spin_limit.setRange(100, 1_000_000)
+        self.spin_limit.setSingleStep(5000)
+        self.spin_limit.setValue(5000)
+        self.spin_limit.setToolTip(
+            "Maximum rows to load into the table.\n\n"
+            "The summary line says when there are more matches than are "
+            "shown, so a capped view is never mistaken for the full set. "
+            "CSV export writes exactly the rows loaded here."
+        )
+        bar.addWidget(self.spin_limit)
+
         btn_refresh = QPushButton("Refresh")
         btn_refresh.setObjectName("secondary")
         btn_refresh.clicked.connect(self.refresh)
@@ -102,6 +119,28 @@ class FindingsPanel(QWidget):
         self.btn_export = QPushButton("Export CSV…")
         self.btn_export.clicked.connect(self._export)
         bar.addWidget(self.btn_export)
+
+        # Pull the selected carved file's actual bytes back out of the image.
+        self.btn_extract = QPushButton("Save selected file from image…")
+        self.btn_extract.setObjectName("secondary")
+        self.btn_extract.setEnabled(False)
+        self.btn_extract.clicked.connect(self._extract_selected)
+        self.btn_extract.setToolTip(
+            "Recover the selected carved file from the evidence image and "
+            "write it to disk.\n\n"
+            "The saved copy is hashed and checked against the hash recorded "
+            "when it was carved, and the export is written to the audit log."
+        )
+        bar.addWidget(self.btn_extract)
+
+        self.chk_receipt = QCheckBox("with hash receipt")
+        self.chk_receipt.setChecked(True)
+        self.chk_receipt.setToolTip(
+            "Save a plain-text receipt next to the recovered file listing "
+            "its origin offset in the image and its hashes under the case's "
+            "hash policy, so its authenticity can be re-checked later."
+        )
+        bar.addWidget(self.chk_receipt)
         root.addLayout(bar)
 
         # ---- summary line ---------------------------------------------
@@ -121,6 +160,7 @@ class FindingsPanel(QWidget):
         self.tbl.setSelectionBehavior(QTableWidget.SelectRows)
         self.tbl.setMinimumHeight(360)
         self.tbl.cellDoubleClicked.connect(self._copy_cell)
+        self.tbl.itemSelectionChanged.connect(self._on_row_selected)
         self.tbl.setStyleSheet(
             "QTableWidget { font-size: 10pt; }"
             "QHeaderView::section { font-weight: 600; padding: 6px; }"
@@ -174,14 +214,27 @@ class FindingsPanel(QWidget):
         if not self.case:
             return
         search = self.ed_search.text().strip() or None
+        limit = self.spin_limit.value()
         if self._mode == "carved":
-            self._rows = self.case.carved_files(search=search, limit=5000)
+            self._rows = self.case.carved_files(search=search, limit=limit)
+            self._total = self.case.count_carved(search=search)
             self._render_carved()
         else:
             subtype = self.cmb_subtype.currentData()
             self._rows = self.case.list_findings(
-                kind=self._mode, subtype=subtype, search=search, limit=5000)
+                kind=self._mode, subtype=subtype, search=search, limit=limit)
+            self._total = self.case.count_findings(
+                kind=self._mode, subtype=subtype, search=search)
             self._render_findings()
+
+    def _truncation_note(self) -> str:
+        """Say so when the table is showing only part of the matches —
+        an examiner must never mistake a capped view for the full set."""
+        total = getattr(self, "_total", len(self._rows))
+        if total > len(self._rows):
+            return (f"  —  showing the first {len(self._rows):,} of "
+                    f"{total:,}; raise the row limit to see more")
+        return ""
 
     def _render_findings(self):
         self.tbl.setColumnCount(4)
@@ -205,7 +258,7 @@ class FindingsPanel(QWidget):
         total_occ = sum(r["count"] for r in self._rows)
         self.lbl_summary.setText(
             f"{len(self._rows):,} distinct {kind_name}  "
-            f"({total_occ:,} total occurrences)")
+            f"({total_occ:,} total occurrences)" + self._truncation_note())
 
     def _render_carved(self):
         self.tbl.setColumnCount(5)
@@ -222,7 +275,8 @@ class FindingsPanel(QWidget):
         self.tbl.setColumnWidth(1, 90)
         self.tbl.setColumnWidth(2, 240)
         self.tbl.setColumnWidth(3, 300)
-        self.lbl_summary.setText(f"{len(self._rows):,} carved files")
+        self.lbl_summary.setText(f"{len(self._rows):,} carved files"
+                                 + self._truncation_note())
 
     # ---- helpers -----------------------------------------------------
 
@@ -230,6 +284,64 @@ class FindingsPanel(QWidget):
         item = self.tbl.item(row, col)
         if item:
             QGuiApplication.clipboard().setText(item.text())
+
+    def _on_row_selected(self):
+        """Only carved rows have bytes in the image to recover."""
+        enabled = False
+        if self._mode == "carved" and self.case:
+            sel = self.tbl.selectionModel()
+            rows = sel.selectedRows() if sel else []
+            if rows and 0 <= rows[0].row() < len(self._rows):
+                enabled = True
+        self.btn_extract.setEnabled(enabled)
+
+    def _extract_selected(self):
+        if self._mode != "carved" or not self.case:
+            return
+        sel = self.tbl.selectionModel()
+        rows = sel.selectedRows() if sel else []
+        if not rows:
+            return
+        r = rows[0].row()
+        if not (0 <= r < len(self._rows)):
+            return
+        rec = self._rows[r]
+        prov = extract_mod.describe(self.case, rec["path"],
+                                    rec.get("evidence_id"))
+        if not prov.exportable:
+            msg_error(self, "Cannot export",
+                      prov.note or "This item cannot be exported.")
+            return
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "Save carved file", prov.suggested_name)
+        if not dest:
+            return
+        try:
+            res = extract_mod.export(
+                self.case, prov, dest,
+                write_receipt=self.chk_receipt.isChecked())
+        except Exception as exc:  # noqa: BLE001
+            msg_error(self, "Export failed", f"{type(exc).__name__}: {exc}")
+            return
+        if res["verified"] is True:
+            verdict = ("Hash verified — matches the hash recorded "
+                       "when this file was carved.")
+        elif res["verified"] is False:
+            verdict = ("WARNING: the saved bytes do NOT match the "
+                       "hash recorded at carve time.")
+        else:
+            verdict = "No carve-time hash was stored, so nothing to verify."
+        digest_lines = "\n".join(
+            f"{a.upper():<8} {d}" for a, d in sorted(res["digests"].items()))
+        paths = [res["path"]]
+        if res.get("receipt"):
+            paths.append(res["receipt"])
+        ExportedDialog(
+            self, title="Carved file saved",
+            intro=(f"Recovered {res['bytes']:,} bytes from "
+                   f"{prov.image_offset:#x}\n\n{digest_lines}\n\n{verdict}"),
+            paths=paths,
+        ).exec()
 
     def _export(self):
         if not self._rows:
@@ -243,23 +355,26 @@ class FindingsPanel(QWidget):
         try:
             with open(p, "w", newline="", encoding="utf-8") as fh:
                 wr = csv.writer(fh)
+                # Values come off the suspect disk — neutralise anything
+                # a spreadsheet would run as a formula. See csv_safe.
                 if self._mode == "carved":
                     wr.writerow(["Name", "SizeBytes", "MD5", "SHA256",
                                  "TLSH", "Path"])
                     for r in self._rows:
-                        wr.writerow([r["name"], r["size_bytes"],
-                                     r.get("md5", ""), r.get("sha256", ""),
-                                     r.get("tlsh", ""), r["path"]])
+                        wr.writerow(csv_safe_row([
+                            r["name"], r["size_bytes"],
+                            r.get("md5", ""), r.get("sha256", ""),
+                            r.get("tlsh", ""), r["path"]]))
                 else:
                     wr.writerow(["Kind", "Type", "Value", "Occurrences",
                                  "FirstOffset"])
                     for r in self._rows:
                         off = r.get("first_offset")
-                        wr.writerow([r["kind"], r["subtype"], r["value"],
-                                     r["count"],
-                                     f"{off:#x}" if isinstance(off, int) else ""])
+                        wr.writerow(csv_safe_row([
+                            r["kind"], r["subtype"], r["value"],
+                            r["count"],
+                            f"{off:#x}" if isinstance(off, int) else ""]))
         except Exception as exc:  # noqa: BLE001
-            from app.ui.centered_msg import msg_error
             msg_error(self, "Export failed", str(exc))
             return
         if self.case:

@@ -85,9 +85,22 @@ class DecryptedStream:
 
     # ---- file-like delegation ------------------------------------------
 
+    # A decrypted volume can be terabytes. read(-1) means "to the end",
+    # which libyal would try to materialise in one allocation, so the
+    # remainder is gathered in bounded chunks instead.
+    _READ_CHUNK = 32 * 1024 * 1024
+
     def read(self, size: int = -1) -> bytes:
         if size is None or size < 0:
-            size = self.volume.get_size() - self.volume.get_offset()
+            remaining = self.volume.get_size() - self.volume.get_offset()
+            parts = []
+            while remaining > 0:
+                chunk = self.volume.read_buffer(min(remaining, self._READ_CHUNK))
+                if not chunk:
+                    break
+                parts.append(chunk)
+                remaining -= len(chunk)
+            return b"".join(parts)
         return self.volume.read_buffer(size)
 
     def seek(self, offset: int, whence: int = 0) -> int:

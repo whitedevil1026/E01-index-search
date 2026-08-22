@@ -74,6 +74,11 @@ SUPPORTED_TYPES = tuple(sorted({s.file_type for s in _SIGNATURES}))
 # coincidence, not a real recoverable file.
 MIN_CARVE_SIZE = 512
 
+# Cap on the single forward read used to locate a footer that lies past
+# the current window. Bounds the cost of a header candidate whose footer
+# never arrives — see the note in _carve_one().
+FORWARD_READ_CAP = 16 * 1024 * 1024
+
 
 @dataclass
 class CarveStats:
@@ -88,13 +93,18 @@ class CarveStats:
 
 
 def _carve_one(blob: bytes, start: int, abs_start: int, sig: _Sig,
-               read_more: Callable[[int, int], bytes]) -> Optional[CarvedFile]:
+               read_more: Callable[[int, int], bytes],
+               no_footer: Optional[dict] = None) -> Optional[CarvedFile]:
     """Determine the extent of one file starting at `start` in `blob`.
 
     NEVER slices `max_size` eagerly — that was a performance trap when
     a short signature (BMP's 2-byte `BM`) matched thousands of times.
     The size is established from a few header bytes (length-based) or
     by locating the footer with `bytes.find` (a C scan, no copy).
+
+    `no_footer` memoises byte ranges already searched unsuccessfully for
+    each signature's footer, so a cluster of false headers does not
+    re-read the same region once per candidate.
 
     Returns None (skip) when the end cannot be reliably determined.
     """
@@ -143,22 +153,91 @@ def _carve_one(blob: bytes, start: int, abs_start: int, sig: _Sig,
         return CarvedFile(sig.file_type, abs_start, size,
                           blob[start:start + size], False)
 
-    # footer not in this window — the file may span past the window.
-    # Do ONE bounded forward read and search there. With our long,
-    # specific signatures a header without an in-window footer is
-    # almost always a genuine large file, not a false positive.
+    # Footer not in this window — the file may span past it. Do ONE
+    # bounded forward read and search there.
+    #
+    # The read is capped at FORWARD_READ_CAP rather than sig.max_size:
+    # a header whose footer never appears (a coincidental `%PDF-1.` in
+    # unallocated space) costs the full read every time, and at
+    # sig.max_size that is 100 MB re-read per false candidate across a
+    # multi-hundred-GB image. The window already carries up to 32 MB of
+    # tail, so a genuine file up to ~tail+cap is still recovered whole.
     tail = blob[start:]
-    extra = read_more(abs_start + len(tail), sig.max_size - len(tail))
+    forward = min(sig.max_size - len(tail), FORWARD_READ_CAP)
+    if forward <= 0:
+        return None
+
+    # Already proved there is no footer anywhere in this range?
+    cached = (no_footer or {}).get(sig.file_type)
+    if cached is not None:
+        c_from, c_to = cached
+        if c_from <= abs_start and abs_start + len(tail) + forward <= c_to:
+            return None
+
+    extra = read_more(abs_start + len(tail), forward)
     if not extra:
         return None
     region = tail + extra
     fidx = region.find(sig.footer, hlen)
     if fidx < 0:
+        if no_footer is not None:
+            # Remember the swept range so neighbouring false headers
+            # inside it are rejected without another read.
+            c_from, c_to = no_footer.get(sig.file_type, (abs_start, abs_start))
+            if abs_start <= c_to:      # contiguous with / inside the known range
+                no_footer[sig.file_type] = (min(c_from, abs_start),
+                                            max(c_to, abs_start + len(region)))
+            else:                      # a new, disjoint region
+                no_footer[sig.file_type] = (abs_start, abs_start + len(region))
         return None
     size = fidx + len(sig.footer)
     if size < MIN_CARVE_SIZE:
         return None
     return CarvedFile(sig.file_type, abs_start, size, region[:size], False)
+
+
+def select_signatures(types: Optional[set] = None) -> list:
+    """The signature set to search, optionally restricted to `types`."""
+    if types:
+        return [s for s in _SIGNATURES if s.file_type in types]
+    return list(_SIGNATURES)
+
+
+def carve_window(blob: bytes, blob_base: int, sigs: list,
+                 read_more: Callable[[int, int], bytes],
+                 no_footer: dict, stats: CarveStats,
+                 on_file: Optional[Callable[[CarvedFile], None]] = None,
+                 max_files: int = 0) -> bool:
+    """Carve every file found in one window of image bytes.
+
+    Shared by `carve_stream` (which reads its own windows) and by the
+    single-pass driver (which hands over windows already read for the
+    string sweep). Keeping one implementation is what lets the two
+    modes be verified byte-for-byte identical.
+
+    Returns False when `max_files` has been reached and the caller
+    should stop.
+    """
+    for sig in sigs:
+        for header in sig.headers:
+            search_from = 0
+            while True:
+                idx = blob.find(header, search_from)
+                if idx < 0:
+                    break
+                search_from = idx + 1
+                carved = _carve_one(blob, idx, blob_base + idx,
+                                    sig, read_more, no_footer)
+                if carved is None:
+                    continue
+                if carved.size < MIN_CARVE_SIZE:
+                    continue
+                if on_file is not None:
+                    on_file(carved)
+                stats.add(carved.file_type, carved.size)
+                if max_files and stats.carved >= max_files:
+                    return False
+    return True
 
 
 def carve_stream(stream: Any, *,
@@ -176,9 +255,7 @@ def carve_stream(stream: Any, *,
     bounded. `types` optionally restricts the formats searched.
     """
     stats = CarveStats()
-    sigs = _SIGNATURES
-    if types:
-        sigs = [s for s in _SIGNATURES if s.file_type in types]
+    sigs = select_signatures(types)
     if not sigs:
         return stats
 
@@ -195,6 +272,10 @@ def carve_stream(stream: Any, *,
         stream.seek(abs_off)
         return stream.read(min(n, total - abs_off))
 
+    # {file_type: (from, to)} — ranges already swept without finding a
+    # footer, so dense runs of false headers cost one read, not one each.
+    no_footer: dict = {}
+
     pos = 0
     carry = b""
     carry_base = 0
@@ -208,25 +289,9 @@ def carve_stream(stream: Any, *,
         blob = carry + chunk
         blob_base = carry_base if carry else pos
 
-        for sig in sigs:
-            for header in sig.headers:
-                search_from = 0
-                while True:
-                    idx = blob.find(header, search_from)
-                    if idx < 0:
-                        break
-                    search_from = idx + 1
-                    carved = _carve_one(blob, idx, blob_base + idx,
-                                        sig, read_more)
-                    if carved is None:
-                        continue
-                    if carved.size < MIN_CARVE_SIZE:
-                        continue
-                    if on_file is not None:
-                        on_file(carved)
-                    stats.add(carved.file_type, carved.size)
-                    if max_files and stats.carved >= max_files:
-                        return stats
+        if not carve_window(blob, blob_base, sigs, read_more, no_footer,
+                            stats, on_file, max_files):
+            return stats
 
         carry = blob[-_MAX_HEADER:]
         carry_base = blob_base + len(blob) - len(carry)

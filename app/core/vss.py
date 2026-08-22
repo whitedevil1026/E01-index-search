@@ -156,31 +156,41 @@ def open_snapshots(stream: Any, keepalive: Optional[list] = None
 
 @dataclass
 class SnapshotDedup:
-    """Tracks file content hashes seen across snapshots so identical
-    files are not re-indexed for every snapshot.
+    """Skips files already seen in a sibling snapshot, so a VSS-heavy
+    image does not index N near-identical copies of every file.
+
+    IMPORTANT — this dedups on an *identity key*, not on content. The
+    caller (filesystem._dedup_skip) builds the key from
+    `path|size|mtime`, because hashing every file in every snapshot
+    would mean reading the whole snapshot set. The trade-off: a file
+    rewritten in place that kept its size AND its mtime is treated as a
+    duplicate and skipped. That is rare (a rewrite normally moves
+    mtime) but it is not impossible, so the key is recorded in the
+    ingest audit entry rather than presented as a content guarantee.
     """
     seen: set = field(default_factory=set)
     n_unique: int = 0
     n_duplicate: int = 0
 
-    def is_new(self, sha256_hex: str) -> bool:
-        """Return True the first time a content hash is seen, False
-        afterwards. A falsy / empty hash is always treated as new
-        (we cannot dedup what we cannot hash).
+    def is_new(self, identity_key: str) -> bool:
+        """Return True the first time an identity key is seen, False
+        afterwards. A falsy / empty key is always treated as new
+        (we cannot dedup what we cannot identify).
         """
-        if not sha256_hex:
+        if not identity_key:
             self.n_unique += 1
             return True
-        if sha256_hex in self.seen:
+        if identity_key in self.seen:
             self.n_duplicate += 1
             return False
-        self.seen.add(sha256_hex)
+        self.seen.add(identity_key)
         self.n_unique += 1
         return True
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, Any]:
         return {
             "unique_files": self.n_unique,
             "duplicate_files_skipped": self.n_duplicate,
-            "distinct_hashes": len(self.seen),
+            "distinct_identity_keys": len(self.seen),
+            "dedup_key": "path|size|mtime",
         }

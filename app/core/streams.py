@@ -129,8 +129,24 @@ def pytsk_img_from_stream(file_like: Any):
             pass
 
         def read(inner, off, length):
+            # TSK expects exactly `length` bytes. The layers below can
+            # short-read (EWF chunk boundaries, a decrypted volume near
+            # its end), and handing TSK a short buffer surfaces as a
+            # bogus "cannot parse this volume". Fill by looping, then
+            # zero-pad the tail beyond end-of-media as TSK's own image
+            # backends do.
             file_like.seek(off)
-            return file_like.read(length)
+            parts = []
+            got = 0
+            while got < length:
+                chunk = file_like.read(length - got)
+                if not chunk:
+                    break
+                parts.append(chunk)
+                got += len(chunk)
+            if got < length:
+                parts.append(b"\x00" * (length - got))
+            return b"".join(parts)
 
         def get_size(inner):
             return size

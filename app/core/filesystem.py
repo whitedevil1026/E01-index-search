@@ -17,6 +17,7 @@ bounded regardless of image size, even with content reading enabled.
 """
 from __future__ import annotations
 
+import stat
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, Optional
 
@@ -60,6 +61,11 @@ class FileRec:
     is_regular: bool = False
     vss_snapshot_id: str | None = None     # set when walking a shadow copy
     fs_backend: str = "tsk"                # tsk / fsntfs / fsapfs
+    # Byte offset of the volume this file lives in, measured from the
+    # start of the image. Without it a later export cannot tell which
+    # filesystem to re-open to fetch the file's bytes back out.
+    volume_offset: int | None = None
+    volume_label: str = ""
     # Raw file bytes, only populated when walk_image(read_content=True).
     content: bytes | None = None
     extra: dict = field(default_factory=dict)
@@ -166,15 +172,18 @@ def scan_volumes(ewf_handle) -> list[VolumeInfo]:
 def walk_image(ewf_handle, max_files: int | None = None,
                read_content: bool = False,
                max_content_bytes: int = 32 * 1024 * 1024,
-               credentials: Optional[enc_mod.Credentials] = None,
+               credentials=None,
                include_vss: bool = False,
                vss_dedup: bool = True,
                log: Optional[Callable[[str], None]] = None) -> Iterator[FileRec]:
     """Walk every filesystem in the image.
 
-    credentials   — applied to any encrypted volume found. If None (or
-                    unlock fails) the volume is tagged "encrypted, no
-                    usable text" and skipped.
+    credentials   — either a single Credentials applied to every
+                    encrypted volume, or a {volume_index: Credentials}
+                    mapping when volumes have different keys (a disk
+                    can carry several independently-encrypted volumes).
+                    If None (or unlock fails) the volume is tagged
+                    "encrypted, no usable text" and skipped.
     include_vss   — also walk Volume Shadow Copy snapshots.
     vss_dedup     — skip snapshot files identical to one already seen.
     log           — optional callback for human-readable progress lines.
@@ -209,7 +218,13 @@ def walk_image(ewf_handle, max_files: int | None = None,
         if kind:
             human = enc_mod.human_name(kind)
             log(f"{label}: {human}-encrypted volume detected")
-            if credentials is None or credentials.is_empty():
+            # Per-volume key if the caller supplied a mapping, else the
+            # single credential set for all volumes.
+            if isinstance(credentials, dict):
+                vol_creds = credentials.get(vi.index)
+            else:
+                vol_creds = credentials
+            if vol_creds is None or vol_creds.is_empty():
                 log(f"{label}: no key supplied — tagged 'encrypted, no usable text'")
                 yield FileRec(
                     inode=None, path=f"/{label}",
@@ -219,7 +234,7 @@ def walk_image(ewf_handle, max_files: int | None = None,
                 )
                 continue
             try:
-                dec = enc_mod.unlock_volume(vstream, kind, credentials)
+                dec = enc_mod.unlock_volume(vstream, kind, vol_creds)
                 volume_stream = dec
                 log(f"{label}: {human} volume unlocked")
             except enc_mod.EncryptionError as exc:
@@ -247,6 +262,9 @@ def walk_image(ewf_handle, max_files: int | None = None,
         for rec in _walk_volume(volume_stream, label, max_files, counter,
                                 read_content, max_content_bytes, log,
                                 snapshot_id=None, dedup=dedup):
+            # Stamp where this file came from so it can be exported later.
+            rec.volume_offset = vi.offset
+            rec.volume_label = label
             yield rec
             if max_files and counter["count"] >= max_files:
                 return
@@ -261,6 +279,8 @@ def walk_image(ewf_handle, max_files: int | None = None,
             for rec in _walk_volume(snap, f"{label}/{sid}", max_files, counter,
                                     read_content, max_content_bytes, log,
                                     snapshot_id=sid, dedup=dedup):
+                rec.volume_offset = vi.offset
+                rec.volume_label = f"{label}/{sid}"
                 yield rec
                 if max_files and counter["count"] >= max_files:
                     return
@@ -268,7 +288,8 @@ def walk_image(ewf_handle, max_files: int | None = None,
     if dedup is not None:
         s = dedup.stats()
         log(f"VSS dedup: {s['unique_files']} unique, "
-            f"{s['duplicate_files_skipped']} duplicates skipped")
+            f"{s['duplicate_files_skipped']} duplicates skipped "
+            f"(key: {s['dedup_key']})")
 
 
 # ---- per-volume walk: pytsk3 primary, direct libyal fallback --------------
@@ -333,10 +354,16 @@ def _walk_volume(stream, label: str, max_files: int | None, counter: dict,
 # ---- The Sleuth Kit walk --------------------------------------------------
 
 def _dedup_skip(dedup, rec_path, size, mtime) -> bool:
-    """Return True if this file should be skipped as a VSS duplicate."""
+    """Return True if this file should be skipped as a VSS duplicate.
+
+    mtime is normalised to a whole second: the pytsk and libfsntfs /
+    libfsapfs backends return it as int, float and None respectively,
+    so an un-normalised key makes the same file look different when a
+    snapshot happens to be walked by the fallback backend.
+    """
     if dedup is None:
         return False
-    key = f"{rec_path}|{size}|{mtime}"
+    key = f"{rec_path}|{size}|{int(mtime or 0)}"
     return not dedup.is_new(key)
 
 
@@ -550,13 +577,21 @@ def _walk_fsapfs_dir(entry, path: str, max_files: int | None, counter: dict,
             continue
         full = path.rstrip("/") + "/" + name
 
+        # An empty APFS directory has zero sub-entries, so the child
+        # count alone misreports it as a regular file. The inode mode
+        # is authoritative; the count is only a fallback.
         is_dir = False
         try:
-            is_dir = sub.get_number_of_sub_file_entries() > 0
+            mode = sub.get_file_mode()
+            if mode is not None:
+                is_dir = stat.S_ISDIR(mode)
+            else:
+                raise ValueError
         except Exception:  # noqa: BLE001
-            pass
-        # APFS reports type more reliably via the entry; an empty
-        # directory still needs detecting — fall back to the size test.
+            try:
+                is_dir = sub.get_number_of_sub_file_entries() > 0
+            except Exception:  # noqa: BLE001
+                pass
         size = None
         try:
             size = sub.get_size()

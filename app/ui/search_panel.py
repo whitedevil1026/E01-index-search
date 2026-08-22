@@ -19,13 +19,16 @@ import time
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QMessageBox, QPushButton, QSpinBox, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QHeaderView,
+    QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from app.core.csv_safe import csv_safe_dict
 from app.core.indexer import HAS_TANTIVY, Indexer
+from app.core import extract as extract_mod
 from app.ui.centered_msg import msg_info
+from app.ui.exported_dialog import ExportedDialog
 from app.ui.help_dialog import info_button
 
 
@@ -35,6 +38,7 @@ class SearchPanel(QWidget):
         self.case = None
         self._last_results: list = []   # rows from the last search, for export
         self._last_mode: str = ""
+        self._sel_prov = None           # provenance of the selected row
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 20, 20, 20)
@@ -145,9 +149,10 @@ class SearchPanel(QWidget):
         root.addWidget(self.status)
 
         # ---- results table -------------------------------------------
-        self.tbl = QTableWidget(0, 6)
+        self.tbl = QTableWidget(0, 8)
         self.tbl.setHorizontalHeaderLabels(
-            ["Score", "Path", "Name", "Size", "Encoding", "SHA-256"]
+            ["Score", "Origin", "Evidence", "Found in", "Name", "Size",
+             "Encoding", "SHA-256"]
         )
         hdr = self.tbl.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.Interactive)
@@ -162,7 +167,50 @@ class SearchPanel(QWidget):
             "QTableWidget { font-size: 10pt; }"
             "QHeaderView::section { font-weight: 600; padding: 6px; }"
         )
+        self.tbl.itemSelectionChanged.connect(self._on_row_selected)
         root.addWidget(self.tbl, 1)
+
+        # ---- provenance of the selected hit ---------------------------
+        prov_box = QGroupBox("Where this hit came from")
+        pv = QVBoxLayout(prov_box)
+        self.prov_view = QPlainTextEdit()
+        self.prov_view.setReadOnly(True)
+        self.prov_view.setMaximumHeight(150)
+        self.prov_view.setPlaceholderText(
+            "Select a result to see exactly where in the image it was "
+            "found — filesystem path, volume, byte offset and hashes."
+        )
+        self.prov_view.setStyleSheet("font-family: Consolas, monospace;")
+        pv.addWidget(self.prov_view)
+
+        prov_bar = QHBoxLayout()
+        self.btn_extract = QPushButton("Export this file from the image…")
+        self.btn_extract.setEnabled(False)
+        self.btn_extract.clicked.connect(self._extract_selected)
+        self.btn_extract.setToolTip(
+            "Read the original bytes back out of the evidence image and "
+            "save them to disk.\n\n"
+            "The exported copy is hashed and checked against the hash "
+            "recorded at ingest, and the export is written to the "
+            "case audit log."
+        )
+        prov_bar.addWidget(self.btn_extract)
+        self.chk_receipt = QCheckBox("Write hash receipt (.verify.txt)")
+        self.chk_receipt.setChecked(True)
+        self.chk_receipt.setToolTip(
+            "Save a plain-text receipt next to the exported file recording "
+            "where in the image it came from, its hashes under the case's "
+            "hash policy, and whether those match the hashes recorded at "
+            "ingest.\n\n"
+            "Lets anyone re-hash the file later and confirm it is authentic."
+        )
+        prov_bar.addWidget(self.chk_receipt)
+        self.lbl_extract = QLabel("")
+        self.lbl_extract.setObjectName("muted")
+        prov_bar.addWidget(self.lbl_extract)
+        prov_bar.addStretch(1)
+        pv.addLayout(prov_bar)
+        root.addWidget(prov_box)
 
         bottom = QLabel(
             "Double-click any cell to copy its value. "
@@ -202,11 +250,24 @@ class SearchPanel(QWidget):
         placeholders = {
             "fulltext": "e.g. invoice  |  password  |  ntfs",
             "name":     "exact-name substring, e.g. system32 (case-insensitive)",
-            "regex":    r"RE2 regex, e.g.  invoice.*2026   |   \d{4}-\d{4}",
+            "regex":    r"RE2 regex — matches anywhere, e.g.  invoice.*2026  |  \$MFT  |  ^C:/Users",
             "sha256":   "SHA-256 hex prefix, e.g. a1b2c3 — finds files whose hash starts with it",
             "tlsh":     "paste a TLSH hash, or a SHA-256 of an already-hashed file, to find similar files",
         }
         self.q.setPlaceholderText(placeholders.get(mode, ""))
+        if mode == "regex":
+            self.q.setToolTip(
+                "Matches anywhere in a term (no need to wrap in .*).\n"
+                "Anchor with ^ or $ for a whole-term match.\n\n"
+                "Searches the file NAME and the full PATH. Paths keep "
+                "their original case and punctuation, so patterns like "
+                r"\$MFT or ^C:/Users work against the path." "\n\n"
+                "Names are tokenised and lowercased for indexing, so "
+                "punctuation such as $ . _ is not part of a name term — "
+                "match those against the path instead."
+            )
+        else:
+            self.q.setToolTip("")
         is_tlsh = (mode == "tlsh")
         self.lbl_dist.setVisible(is_tlsh)
         self.spin_dist.setVisible(is_tlsh)
@@ -264,25 +325,30 @@ class SearchPanel(QWidget):
 
         # ---- render (Score / Path / Name / Size / Encoding / SHA-256) --
         self.tbl.setHorizontalHeaderLabels(
-            ["Score", "Path", "Name", "Size", "Encoding", "SHA-256"])
+            ["Score", "Origin", "Evidence", "Found in", "Name", "Size",
+             "Encoding", "SHA-256"])
         self.tbl.setRowCount(len(hits))
+        origins = [extract_mod.origin_of(h.path) for h in hits]
         for i, h in enumerate(hits):
             self.tbl.setItem(i, 0, QTableWidgetItem(f"{h.score:.3f}"))
-            self.tbl.setItem(i, 1, QTableWidgetItem(h.path))
-            self.tbl.setItem(i, 2, QTableWidgetItem(h.name))
-            self.tbl.setItem(i, 3, QTableWidgetItem(str(h.size_bytes or "")))
-            self.tbl.setItem(i, 4, QTableWidgetItem(h.encoding or ""))
-            self.tbl.setItem(i, 5, QTableWidgetItem((h.sha256 or "")[:16]))
+            self.tbl.setItem(i, 1, QTableWidgetItem(origins[i]))
+            self.tbl.setItem(i, 2, QTableWidgetItem(self._evidence_label(h.evidence_uuid)))
+            self.tbl.setItem(i, 3, QTableWidgetItem(h.path))
+            self.tbl.setItem(i, 4, QTableWidgetItem(h.name))
+            self.tbl.setItem(i, 5, QTableWidgetItem(str(h.size_bytes or "")))
+            self.tbl.setItem(i, 6, QTableWidgetItem(h.encoding or ""))
+            self.tbl.setItem(i, 7, QTableWidgetItem((h.sha256 or "")[:16]))
         self.tbl.resizeColumnsToContents()
-        if self.tbl.columnWidth(1) < 280:
-            self.tbl.setColumnWidth(1, 280)
+        if self.tbl.columnWidth(3) < 280:
+            self.tbl.setColumnWidth(3, 280)
 
         # keep results for export
         self._last_results = [
-            {"score": f"{h.score:.3f}", "path": h.path, "name": h.name,
-             "size_bytes": h.size_bytes, "encoding": h.encoding or "",
-             "sha256": h.sha256 or ""}
-            for h in hits
+            {"score": f"{h.score:.3f}", "origin": origins[i], "path": h.path,
+             "name": h.name, "size_bytes": h.size_bytes,
+             "encoding": h.encoding or "", "sha256": h.sha256 or "",
+             "evidence_uuid": h.evidence_uuid}
+            for i, h in enumerate(hits)
         ]
         self._last_mode = mode
         self.btn_export.setEnabled(bool(hits))
@@ -370,11 +436,16 @@ class SearchPanel(QWidget):
                     except Exception:  # noqa: BLE001
                         pass
                 n_idx += 1
-            # dedup (a doc can match on both name and path)
+            # Dedup the same document matching on both `name` and `path`.
+            # The key MUST include the evidence item: a case can hold
+            # several images and paths like /$RECYCLE.BIN, /Boot and
+            # /System Volume Information exist in all of them. Keying on
+            # (path, name) alone collapsed those into one row and hid the
+            # fact that the file is present on the other drives too.
             seen = set()
             deduped = []
             for h in all_hits:
-                k = (h.path, h.name)
+                k = (h.evidence_uuid, h.path, h.name)
                 if k not in seen:
                     seen.add(k)
                     deduped.append(h)
@@ -478,26 +549,32 @@ class SearchPanel(QWidget):
         dt_ms = (time.time() - t0) * 1000
         self.btn.setEnabled(True)
 
-        # render — Distance / Path / Name / Size / (blank) / SHA-256
+        # render — Distance / Origin / Found in / Name / Size / _ / SHA-256
         self.tbl.setHorizontalHeaderLabels(
-            ["Distance", "Path", "Name", "Size", "", "SHA-256"])
+            ["Distance", "Origin", "Evidence", "Found in", "Name", "Size",
+             "", "SHA-256"])
         self.tbl.setRowCount(len(results))
+        origins = [extract_mod.origin_of(r["path"]) for r in results]
         for i, r in enumerate(results):
             self.tbl.setItem(i, 0, QTableWidgetItem(str(r["distance"])))
-            self.tbl.setItem(i, 1, QTableWidgetItem(r["path"]))
-            self.tbl.setItem(i, 2, QTableWidgetItem(r["name"]))
-            self.tbl.setItem(i, 3, QTableWidgetItem(str(r["size_bytes"] or "")))
-            self.tbl.setItem(i, 4, QTableWidgetItem(""))
-            self.tbl.setItem(i, 5, QTableWidgetItem((r["sha256"] or "")[:16]))
+            self.tbl.setItem(i, 1, QTableWidgetItem(origins[i]))
+            self.tbl.setItem(i, 2, QTableWidgetItem(
+                self._evidence_label(evidence_id=r.get("evidence_id"))))
+            self.tbl.setItem(i, 3, QTableWidgetItem(r["path"]))
+            self.tbl.setItem(i, 4, QTableWidgetItem(r["name"]))
+            self.tbl.setItem(i, 5, QTableWidgetItem(str(r["size_bytes"] or "")))
+            self.tbl.setItem(i, 6, QTableWidgetItem(""))
+            self.tbl.setItem(i, 7, QTableWidgetItem((r["sha256"] or "")[:16]))
         self.tbl.resizeColumnsToContents()
-        if self.tbl.columnWidth(1) < 280:
-            self.tbl.setColumnWidth(1, 280)
+        if self.tbl.columnWidth(3) < 280:
+            self.tbl.setColumnWidth(3, 280)
 
         self._last_results = [
-            {"distance": r["distance"], "path": r["path"], "name": r["name"],
+            {"distance": r["distance"], "origin": origins[i],
+             "path": r["path"], "name": r["name"],
              "size_bytes": r["size_bytes"], "sha256": r["sha256"],
-             "tlsh": r["tlsh"]}
-            for r in results
+             "tlsh": r["tlsh"], "evidence_id": r.get("evidence_id")}
+            for i, r in enumerate(results)
         ]
         self._last_mode = "tlsh"
         self.btn_export.setEnabled(bool(results))
@@ -535,11 +612,20 @@ class SearchPanel(QWidget):
         if not p:
             return
         try:
-            cols = list(self._last_results[0].keys())
+            # Union of keys, not just the first row's — a later row with
+            # an extra field would otherwise raise mid-write and lose
+            # the whole export.
+            cols: list[str] = []
+            for r in self._last_results:
+                for k in r:
+                    if k not in cols:
+                        cols.append(k)
             with open(p, "w", newline="", encoding="utf-8") as fh:
-                wr = csv.DictWriter(fh, fieldnames=cols)
+                # Results are evidence-derived; neutralise spreadsheet
+                # formula leaders. See app.core.csv_safe.
+                wr = csv.DictWriter(fh, fieldnames=cols, restval="")
                 wr.writeheader()
-                wr.writerows(self._last_results)
+                wr.writerows(csv_safe_dict(r) for r in self._last_results)
         except Exception as exc:  # noqa: BLE001
             msg_info(self, "Export failed", str(exc))
             return
@@ -549,6 +635,112 @@ class SearchPanel(QWidget):
                            "rows": len(self._last_results), "path": p})
         msg_info(self, "Results exported",
                  f"Wrote {len(self._last_results)} rows to:\n{p}")
+
+    # ---- provenance / extraction -------------------------------------
+
+    def _evidence_label(self, evidence_uuid: str = "",
+                        evidence_id=None) -> str:
+        """Short name of the image a hit came from. A case can hold
+        several images, so the row has to say which one."""
+        if not self.case:
+            return ""
+        row = None
+        if evidence_uuid:
+            row = self.case.evidence_by_uuid(evidence_uuid)
+        if row is None and evidence_id is not None:
+            row = self.case.evidence_by_id(evidence_id)
+        if row is None:
+            return ""
+        from pathlib import Path as _P
+        return _P(row["path"]).name
+
+    def _selected_indexed_path(self) -> str:
+        rows = self.tbl.selectionModel().selectedRows() \
+            if self.tbl.selectionModel() else []
+        if not rows:
+            return ""
+        r = rows[0].row()
+        if 0 <= r < len(self._last_results):
+            return self._last_results[r].get("path", "")
+        return ""
+
+    def _on_row_selected(self):
+        self._sel_prov = None
+        self.btn_extract.setEnabled(False)
+        self.lbl_extract.setText("")
+        path = self._selected_indexed_path()
+        if not path or not self.case:
+            self.prov_view.setPlainText("")
+            return
+        # Pass the evidence UUID the hit carries: in a multi-image case
+        # the same path can exist in several images, and resolving
+        # without it would report — and export — the wrong one.
+        ev_uuid = ""
+        sel = self.tbl.selectionModel()
+        rows = sel.selectedRows() if sel else []
+        if rows and 0 <= rows[0].row() < len(self._last_results):
+            ev_uuid = self._last_results[rows[0].row()].get("evidence_uuid", "")
+        ev_id = None
+        if rows and 0 <= rows[0].row() < len(self._last_results):
+            ev_id = self._last_results[rows[0].row()].get("evidence_id")
+        try:
+            prov = extract_mod.describe(self.case, path,
+                                        evidence_id=ev_id,
+                                        evidence_uuid=ev_uuid)
+        except Exception as exc:  # noqa: BLE001
+            self.prov_view.setPlainText(f"Could not resolve origin: {exc}")
+            return
+        self._sel_prov = prov
+        width = max(len(k) for k, _ in prov.summary_lines()) if \
+            prov.summary_lines() else 10
+        self.prov_view.setPlainText(
+            "\n".join(f"{k:<{width}} :  {v}" for k, v in prov.summary_lines())
+        )
+        self.btn_extract.setEnabled(bool(prov.exportable))
+        if not prov.exportable:
+            self.lbl_extract.setText(prov.note or "not exportable")
+
+    def _extract_selected(self):
+        prov = getattr(self, "_sel_prov", None)
+        if prov is None or not self.case:
+            return
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "Export file from image", prov.suggested_name)
+        if not dest:
+            return
+        self.btn_extract.setEnabled(False)
+        self.lbl_extract.setText("extracting…")
+        QGuiApplication.processEvents()
+        try:
+            res = extract_mod.export(
+                self.case, prov, dest,
+                write_receipt=self.chk_receipt.isChecked())
+        except Exception as exc:  # noqa: BLE001
+            self.btn_extract.setEnabled(True)
+            self.lbl_extract.setText("")
+            msg_info(self, "Export failed", f"{type(exc).__name__}: {exc}")
+            return
+        self.btn_extract.setEnabled(True)
+        if res["verified"] is True:
+            verdict = ("Hash verified — the exported bytes match the "
+                       "hash recorded at ingest.")
+        elif res["verified"] is False:
+            verdict = ("WARNING: the exported bytes do NOT match the "
+                       "hash recorded at ingest.")
+        else:
+            verdict = "No ingest-time hash was stored, so nothing to verify."
+        self.lbl_extract.setText(f"exported {res['bytes']:,} bytes")
+        digest_lines = "\n".join(
+            f"{a.upper():<8} {d}" for a, d in sorted(res["digests"].items()))
+        paths = [res["path"]]
+        if res.get("receipt"):
+            paths.append(res["receipt"])
+        ExportedDialog(
+            self, title="Exported from image",
+            intro=(f"Wrote {res['bytes']:,} bytes\n\n"
+                   f"{digest_lines}\n\n{verdict}"),
+            paths=paths,
+        ).exec()
 
     def _copy_cell(self, row: int, col: int):
         item = self.tbl.item(row, col)

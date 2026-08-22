@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -60,7 +61,13 @@ CREATE TABLE IF NOT EXISTS files (
     tlsh TEXT,
     is_allocated INTEGER NOT NULL DEFAULT 1,
     ads_name TEXT,
-    vss_snapshot_id TEXT
+    vss_snapshot_id TEXT,
+    -- Provenance needed to fetch this file's bytes back out of the
+    -- image later (see app/core/extract.py):
+    volume_offset INTEGER,       -- volume start, from the image start
+    volume_label TEXT,           -- 'vol1', 'vol1/vss2', ...
+    fs_backend TEXT,             -- tsk / fsntfs / fsapfs
+    data_offset INTEGER          -- carved files: absolute image offset
 );
 CREATE INDEX IF NOT EXISTS idx_files_evidence ON files(evidence_id);
 CREATE INDEX IF NOT EXISTS idx_files_sha256 ON files(sha256);
@@ -107,6 +114,30 @@ CREATE INDEX IF NOT EXISTS idx_findings_kind ON findings(kind, subtype);
 """
 
 SCHEMA_VERSION = 1
+
+# Serialises audit-log appends across this process's threads so the
+# hash chain cannot fork. See Case.log().
+_AUDIT_LOCK = threading.Lock()
+
+# Columns added to `files` after the first release. CREATE TABLE IF NOT
+# EXISTS will not add a column to a table that already exists, so a case
+# opened from an earlier build needs them backfilled explicitly.
+_FILES_ADDED_COLUMNS = (
+    ("volume_offset", "INTEGER"),
+    ("volume_label", "TEXT"),
+    ("fs_backend", "TEXT"),
+    ("data_offset", "INTEGER"),
+)
+
+
+def _migrate(conn) -> None:
+    """Add columns introduced after a case was created. Existing rows
+    get NULL, which the export path reports as 'provenance unavailable —
+    re-ingest to enable export' rather than guessing."""
+    have = {r[1] for r in conn.execute("PRAGMA table_info(files)").fetchall()}
+    for name, coltype in _FILES_ADDED_COLUMNS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE files ADD COLUMN {name} {coltype}")
 
 
 @dataclass
@@ -171,6 +202,7 @@ class Case:
             raise FileNotFoundError(f"No case.db at {c.db_path}")
         with c.connect() as conn:
             conn.executescript(SCHEMA)  # idempotent — migrate-friendly
+            _migrate(conn)
         c.log("case.open", {})
         return c
 
@@ -178,7 +210,8 @@ class Case:
 
     @contextmanager
     def connect(self):
-        conn = sqlite3.connect(self.db_path, isolation_level=None)  # autocommit-ish
+        conn = sqlite3.connect(self.db_path, isolation_level=None,  # autocommit-ish
+                               timeout=30.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -254,13 +287,16 @@ class Case:
                 conn.execute(
                     "INSERT INTO files(evidence_id, inode, path, name, size_bytes, "
                     "mtime, atime, ctime, crtime, md5, sha256, tlsh, "
-                    "is_allocated, ads_name, vss_snapshot_id) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "is_allocated, ads_name, vss_snapshot_id, "
+                    "volume_offset, volume_label, fs_backend, data_offset) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (evidence_id, r.get("inode"), r["path"], r["name"], r.get("size_bytes"),
                      r.get("mtime"), r.get("atime"), r.get("ctime"), r.get("crtime"),
                      r.get("md5"), r.get("sha256"), r.get("tlsh"),
                      1 if r.get("is_allocated", True) else 0,
-                     r.get("ads_name"), r.get("vss_snapshot_id")),
+                     r.get("ads_name"), r.get("vss_snapshot_id"),
+                     r.get("volume_offset"), r.get("volume_label"),
+                     r.get("fs_backend"), r.get("data_offset")),
                 )
                 n += 1
             conn.execute("COMMIT")
@@ -314,6 +350,37 @@ class Case:
                 "first_offset", "added_at"]
         return [dict(zip(cols, r)) for r in rows]
 
+    def count_findings(self, kind: str | None = None,
+                       subtype: str | None = None,
+                       search: str | None = None) -> int:
+        """How many rows `list_findings` would return with no limit —
+        so the UI can say when the view it shows is truncated."""
+        q = "SELECT COUNT(*) FROM findings"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if subtype:
+            clauses.append("subtype = ?")
+            params.append(subtype)
+        if search:
+            clauses.append("value LIKE ?")
+            params.append(f"%{search}%")
+        if clauses:
+            q += " WHERE " + " AND ".join(clauses)
+        with self.connect() as conn:
+            return int(conn.execute(q, params).fetchone()[0] or 0)
+
+    def count_carved(self, search: str | None = None) -> int:
+        q = "SELECT COUNT(*) FROM files WHERE path LIKE '/(carved)/%'"
+        params: list[Any] = []
+        if search:
+            q += " AND (name LIKE ? OR sha256 LIKE ?)"
+            params += [f"%{search}%", f"%{search}%"]
+        with self.connect() as conn:
+            return int(conn.execute(q, params).fetchone()[0] or 0)
+
     def findings_summary(self) -> dict[str, dict[str, int]]:
         """Return {kind: {subtype: total_count}} across the case."""
         with self.connect() as conn:
@@ -345,6 +412,43 @@ class Case:
                 "md5", "sha256", "tlsh"]
         return [dict(zip(cols, r)) for r in rows]
 
+    def file_by_path(self, path: str, evidence_id: int | None = None) -> dict | None:
+        """Look a file row up by its indexed path — the bridge from a
+        search hit back to the provenance needed to export it."""
+        q = ("SELECT id, evidence_id, inode, path, name, size_bytes, md5, "
+             "sha256, tlsh, is_allocated, vss_snapshot_id, volume_offset, "
+             "volume_label, fs_backend, data_offset FROM files WHERE path = ?")
+        params: list[Any] = [path]
+        if evidence_id is not None:
+            q += " AND evidence_id = ?"
+            params.append(evidence_id)
+        q += " LIMIT 1"
+        with self.connect() as conn:
+            row = conn.execute(q, params).fetchone()
+        if not row:
+            return None
+        cols = ["id", "evidence_id", "inode", "path", "name", "size_bytes",
+                "md5", "sha256", "tlsh", "is_allocated", "vss_snapshot_id",
+                "volume_offset", "volume_label", "fs_backend", "data_offset"]
+        return dict(zip(cols, row))
+
+    def evidence_by_id(self, evidence_id: int) -> dict | None:
+        for r in self.list_evidence():
+            if r["id"] == evidence_id:
+                return r
+        return None
+
+    def evidence_by_uuid(self, evidence_uuid: str) -> dict | None:
+        """Resolve the UUID stored on every indexed document back to its
+        evidence row — how a search hit is attributed to the image it
+        actually came from."""
+        if not evidence_uuid:
+            return None
+        for r in self.list_evidence():
+            if r["evidence_uuid"] == evidence_uuid:
+                return r
+        return None
+
     # ---- TLSH similarity -------------------------------------------------
 
     def tlsh_lookup(self, sha256: str) -> str | None:
@@ -367,35 +471,53 @@ class Case:
         from app.core.hashing import tlsh_distance
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT path, name, size_bytes, sha256, tlsh FROM files "
+                "SELECT path, name, size_bytes, sha256, tlsh, evidence_id "
+                "FROM files "
                 "WHERE tlsh IS NOT NULL AND tlsh != ''"
             ).fetchall()
         out: list[dict] = []
-        for path, name, size, sha, tl in rows:
+        for path, name, size, sha, tl, ev_id in rows:
             d = tlsh_distance(query_tlsh, tl)
             if d is not None and d <= max_distance:
                 out.append({"path": path, "name": name, "size_bytes": size,
-                            "sha256": sha, "tlsh": tl, "distance": d})
+                            "sha256": sha, "tlsh": tl, "distance": d,
+                            "evidence_id": ev_id})
         out.sort(key=lambda r: r["distance"])
         return out[:limit]
 
     # ---- audit log -------------------------------------------------------
 
     def log(self, action: str, payload: dict[str, Any], actor: str = "examiner") -> None:
-        with self.connect() as conn:
-            prev = conn.execute(
-                "SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            prev_hash = prev[0] if prev else ("0" * 64)
-            ts = time.time()
-            payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-            canon = f"{ts}|{actor}|{action}|{payload_json}|{prev_hash}".encode("utf-8")
-            row_hash = hashlib.sha256(canon).hexdigest()
-            conn.execute(
-                "INSERT INTO audit_log(ts, actor, action, payload_json, prev_hash, row_hash) "
-                "VALUES (?,?,?,?,?,?)",
-                (ts, actor, action, payload_json, prev_hash, row_hash),
-            )
+        # The GUI thread and the ingest worker both log. Reading
+        # prev_hash and inserting the new row must be atomic or two
+        # rows can chain off the same predecessor, permanently breaking
+        # verify_audit_chain. BEGIN IMMEDIATE serialises across
+        # processes; _AUDIT_LOCK serialises this process's threads so
+        # they queue instead of hitting SQLITE_BUSY.
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        with _AUDIT_LOCK, self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                prev = conn.execute(
+                    "SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                prev_hash = prev[0] if prev else ("0" * 64)
+                ts = time.time()
+                canon = f"{ts}|{actor}|{action}|{payload_json}|{prev_hash}".encode("utf-8")
+                row_hash = hashlib.sha256(canon).hexdigest()
+                conn.execute(
+                    "INSERT INTO audit_log(ts, actor, action, payload_json, prev_hash, row_hash) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (ts, actor, action, payload_json, prev_hash, row_hash),
+                )
+            except Exception:
+                # Never let a failed rollback mask the original error.
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+            conn.execute("COMMIT")
 
     def audit_rows(self, limit: int = 500) -> list[dict]:
         with self.connect() as conn:
