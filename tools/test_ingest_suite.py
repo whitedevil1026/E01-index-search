@@ -327,6 +327,51 @@ def run(img_path: str) -> int:
     print(f"  ingest wall clock: {elapsed:.1f}s")
 
     # ================================================================
+    section("DURING — live-run safety defaults and truncation reporting")
+    # ================================================================
+    fresh = IngestPanel()
+    check("file-count cap defaults to a COMPLETE walk",
+          fresh.spin_max.value() == 0,
+          f"default is {fresh.spin_max.value()} — a capped default would "
+          f"silently under-collect a real case")
+    check("sweep workers default above 1", fresh.spin_workers.value() > 1,
+          f"{fresh.spin_workers.value()}")
+    check("single-pass is off by default (parallel sweep wins)",
+          not fresh.chk_single_pass.isChecked())
+
+    # A capped walk must announce itself everywhere an examiner looks.
+    tcase = Case.create(root / "trunc", "trunc", "tester")
+    tp = IngestPanel()
+    tp.set_case(tcase)
+    tp.path_edit.setText(img_path)
+    tp._inspect()
+    app.processEvents()
+    tp.spin_max.setValue(5)
+    tp.chk_index.setChecked(True)
+    for off in ("chk_carve", "chk_yara", "chk_raw_strings",
+                "chk_raw_patterns", "chk_hash", "chk_content"):
+        cb = getattr(tp, off, None)
+        if cb is not None:
+            cb.setChecked(False)
+    tlogs = []
+    tp._append_log = lambda s: tlogs.append(s)
+    tp._run()
+    tp._worker.wait(30 * 60 * 1000)
+    app.processEvents()
+    n_trunc = sum(1 for l in tlogs if "TRUNCATED" in l)
+    n_incomp = sum(1 for l in tlogs if "INCOMPLETE" in l)
+    check("a truncated walk says so in the ingest log", n_trunc > 0,
+          f"{n_trunc} warning(s)" if n_trunc else
+          "no truncation warning emitted")
+    check("a truncated walk says so in the result summary", n_incomp > 0,
+          f"{n_incomp} line(s)" if n_incomp else
+          "summary did not flag the partial case")
+    with tcase.connect() as conn:
+        acts = [r[0] for r in conn.execute("SELECT action FROM audit_log")]
+    check("a truncated walk is recorded in the audit log",
+          "ingest.walk_truncated" in acts, str(sorted(set(acts))))
+
+    # ================================================================
     section("AFTER — database contents and provenance")
     # ================================================================
     with case.connect() as conn:

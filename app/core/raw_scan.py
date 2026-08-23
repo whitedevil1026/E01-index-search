@@ -339,10 +339,18 @@ def parallel_string_sweep(segments: Sequence[str], fmt: str, total: int, *,
                 done_bytes += body
                 if progress_cb is not None:
                     progress_cb(min(done_bytes, total), total)
-    except Exception:
-        # Any failure to fan out (spawn blocked, pickling, worker crash)
-        # must not lose the pass — the caller falls back to sequential.
-        raise
+    except concurrent.futures.process.BrokenProcessPool as exc:
+        # Opaque by default. The overwhelmingly common cause on a
+        # spawn-based platform is an entry module that runs work at
+        # import time instead of under `if __name__ == "__main__":`,
+        # because every worker re-imports it. Say so; the caller falls
+        # back to the sequential sweep regardless.
+        raise RuntimeError(
+            "the parallel sweep worker pool died. If this tool is being "
+            "driven from a script, its top-level code must sit under "
+            '`if __name__ == "__main__":` — on Windows each worker '
+            "re-imports the entry module. Falling back to a single "
+            f"process. ({exc})") from exc
     return stats
 
 

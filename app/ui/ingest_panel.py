@@ -228,11 +228,20 @@ class IngestPanel(QWidget):
         opt_row.addWidget(QLabel("File-count cap:"))
         self.spin_max = QSpinBox()
         self.spin_max.setRange(0, 10_000_000)
-        self.spin_max.setValue(5000)
+        # Default to a COMPLETE walk. A capped walk that quietly stops
+        # partway is the worst failure mode for evidence: the case looks
+        # finished and simply does not contain most of the drive. Set a
+        # cap deliberately for triage; the log and the audit entry both
+        # say plainly when one truncated collection.
+        self.spin_max.setValue(0)
         self.spin_max.setSuffix("  (0 = walk the entire image)")
         self.spin_max.setToolTip(
-            "Stop after enumerating this many files. Useful for quick "
-            "previews on huge images. 0 disables the cap."
+            "Stop after enumerating this many files.\n\n"
+            "0 (the default) walks the whole image, which is what a real "
+            "case needs. Set a number only for a quick triage pass on a "
+            "huge image — the ingest log and the audit entry will record "
+            "that the walk was truncated so a partial case is never "
+            "mistaken for a complete one."
         )
         opt_row.addWidget(self.spin_max)
         opt_row.addSpacing(20)
@@ -912,6 +921,7 @@ class IngestPanel(QWidget):
                        one sequential read.
         """
         summary: dict = {}
+        CARVE_FILE_CAP = 100_000
         encodings = ENCODING_SETS.get(enc_set, ENCODING_SETS[DEFAULT_ENCODING_SET])
         w.log.emit(f"  encodings: {enc_set} -> {', '.join(encodings)}")
 
@@ -935,6 +945,10 @@ class IngestPanel(QWidget):
         # Capped so a pathological image cannot exhaust memory.
         IOC_DISTINCT_CAP = 500_000
         ioc_distinct: dict = {}
+        # Once the cap is reached new indicators are dropped. That is a
+        # deliberate memory bound, but it must never pass unnoticed: a
+        # capped findings set looks exactly like a complete one.
+        ioc_capped = {"hit": False, "dropped": 0}
 
         do_sweep = do_raw_strings or do_raw_patterns
         carve_active = do_carve or do_yara
@@ -986,6 +1000,9 @@ class IngestPanel(QWidget):
                                 slot[0] += 1
                             elif len(ioc_distinct) < IOC_DISTINCT_CAP:
                                 ioc_distinct[key] = [1, page.offset]
+                            else:
+                                ioc_capped["hit"] = True
+                                ioc_capped["dropped"] += 1
                         body_parts.append("\n".join(
                             f"{k}: {v}" for k, v, _ in phits))
                 if body_parts and writer is not None and indexer is not None:
@@ -1030,6 +1047,18 @@ class IngestPanel(QWidget):
                         w.log.emit(f"  stored {len(finding_rows):,} distinct "
                                    f"IoC indicators to findings")
                         summary["distinct_iocs"] = len(finding_rows)
+                        if ioc_capped["hit"]:
+                            summary["ioc_truncated"] = ioc_capped["dropped"]
+                            w.log.emit(
+                                f"  [TRUNCATED] the distinct-IoC cap of "
+                                f"{IOC_DISTINCT_CAP:,} was reached; "
+                                f"{ioc_capped['dropped']:,} further "
+                                f"occurrences of NEW indicators were not "
+                                f"recorded. Findings are INCOMPLETE for "
+                                f"this evidence item.")
+                            case.log("ingest.ioc_truncated",
+                                     {"cap": IOC_DISTINCT_CAP,
+                                      "dropped": ioc_capped["dropped"]})
 
             if not combined:
                 stats = None
@@ -1132,7 +1161,8 @@ class IngestPanel(QWidget):
                     # passes exactly.
                     with open_handle(self._info) as ch:
                         sstats, cstats = sweep_and_carve(
-                            ch, encodings=encodings, max_files=100000,
+                            ch, encodings=encodings,
+                            max_files=CARVE_FILE_CAP,
                             on_page=on_page, on_file=on_carved,
                             progress_cb=lambda d, t: w.progress.emit(d, t, ""),
                             cancel_cb=lambda: w.cancelled,
@@ -1141,7 +1171,8 @@ class IngestPanel(QWidget):
                 else:
                     with open_handle(self._info) as ch:
                         cstats = carve_stream(
-                            ch, max_files=100000, on_file=on_carved,
+                            ch, max_files=CARVE_FILE_CAP,
+                            on_file=on_carved,
                             progress_cb=lambda d, t: w.progress.emit(d, t, ""),
                             cancel_cb=lambda: w.cancelled,
                         )
@@ -1149,6 +1180,14 @@ class IngestPanel(QWidget):
                     case.add_files(ev_id, carved_rows)
                 w.log.emit(f"  carved {cstats.carved} files  "
                            f"{dict(cstats.per_type)}")
+                if cstats.carved >= CARVE_FILE_CAP:
+                    summary["carve_truncated"] = True
+                    w.log.emit(
+                        f"  [TRUNCATED] carving stopped at the cap of "
+                        f"{CARVE_FILE_CAP:,} files; the image may hold "
+                        f"more. Carved output is INCOMPLETE.")
+                    case.log("ingest.carve_truncated",
+                             {"cap": CARVE_FILE_CAP})
                 summary["carved"] = cstats.carved
                 case.log("ingest.carve", {"carved": cstats.carved,
                                           "by_type": dict(cstats.per_type)})
@@ -1584,8 +1623,23 @@ class IngestPanel(QWidget):
                            f"{n_hash_skipped} skipped (larger than "
                            f"{HASH_FILE_CAP // (1024*1024)} MB)")
 
+            # The file-count cap stops the walk mid-filesystem. A case
+            # truncated this way looks complete, so say so unmistakably
+            # in the log, the summary and the audit record.
+            walk_truncated = bool(max_files) and n_files >= max_files
+            if walk_truncated:
+                w.log.emit(
+                    f"  [TRUNCATED] the file-count cap of {max_files:,} "
+                    f"was reached, so the filesystem walk STOPPED EARLY. "
+                    f"This evidence item is NOT fully enumerated — set the "
+                    f"cap to 0 and re-ingest for a complete case.")
+                case.log("ingest.walk_truncated",
+                         {"evidence_id": ev_id, "cap": max_files,
+                          "files_enumerated": n_files})
+
             case.log("ingest.complete", {
                 "evidence_id": ev_id, "files": n_files,
+                "walk_truncated": walk_truncated,
                 "content_extracted": n_extracted,
                 "files_hashed": n_hashed,
                 "hash_skipped_oversize": n_hash_skipped,
@@ -1598,6 +1652,9 @@ class IngestPanel(QWidget):
                 "cancelled": w.cancelled,
             })
             summary = f"ingested {n_files} files"
+            if walk_truncated:
+                summary = (f"INCOMPLETE — walk stopped at the "
+                           f"{max_files:,}-file cap; " + summary)
             if do_hash:
                 summary += f", hashed {n_hashed}"
             if do_content:
