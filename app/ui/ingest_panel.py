@@ -22,6 +22,11 @@ from app.core.filesystem import walk_image, scan_volumes, HAS_PYTSK3
 from app.core.hashing import hash_stream
 from app.core.hash_policy import HashPolicy
 from app.core.indexer import HAS_TANTIVY, Indexer, stable_doc_id
+try:
+    from app.core.known_files import KnownSetStore, default_store_path
+except Exception:  # noqa: BLE001
+    KnownSetStore = None
+    default_store_path = None
 from app.core.text_extract import extract_text, MAX_TEXT_CHARS
 from app.core.worker import Worker
 from app.core import encryption as enc_mod
@@ -247,9 +252,27 @@ class IngestPanel(QWidget):
         opt_row.addSpacing(20)
         self.chk_hash = QCheckBox("Hash file contents per case policy (slow)")
         self.chk_hash.setChecked(True)
+        self.chk_known = QCheckBox("Flag known files (NSRL / imported hash sets)")
+        self.chk_known.setChecked(True)
+        self.chk_known.setToolTip(
+            "Compare every hashed file against the imported hash sets and "
+            "label the matches.\n\n"
+            "This separates files that shipped with the operating system or "
+            "an application from files that were put on the machine, which "
+            "is usually the first question worth asking.\n\n"
+            "A match only LABELS the file. Nothing is removed from the "
+            "index or the database: hash sets contain plenty of binaries "
+            "that attackers abuse, so 'known' never means 'harmless'. "
+            "Hiding known files is a view option in Search, off by "
+            "default, and it always states how many rows it hides.\n\n"
+            "Requires per-file hashing, and at least one hash set imported "
+            "in the Known Files tab."
+        )
         self.chk_index = QCheckBox("Index file names + paths")
         self.chk_index.setChecked(True)
         opt_row.addWidget(self.chk_hash)
+        opt_row.addSpacing(16)
+        opt_row.addWidget(self.chk_known)
         opt_row.addWidget(self.chk_index)
         opt_row.addStretch(1)
         ol.addLayout(opt_row)
@@ -1251,6 +1274,7 @@ class IngestPanel(QWidget):
         info = self._info
         max_files = self.spin_max.value() or None
         do_hash = self.chk_hash.isChecked()
+        do_known = self.chk_known.isChecked() and do_hash
         do_index = self.chk_index.isChecked() and HAS_TANTIVY
         do_content = self.chk_content.isChecked() and HAS_TANTIVY
         do_artifacts = self.chk_artifacts.isChecked() and HAS_TANTIVY
@@ -1350,6 +1374,28 @@ class IngestPanel(QWidget):
             n_since_commit = 0
             n_extracted = 0           # files with searchable text extracted
             n_hashed = 0              # files hashed
+            n_known = 0               # files matching a known-file set
+            # Known-file hash sets are reference data shared across
+            # cases. A match only LABELS the row (see known_files) — it
+            # never removes a file from the index or the database.
+            known_store = None
+            if do_known and KnownSetStore is not None:
+                try:
+                    known_store = KnownSetStore(default_store_path())
+                    n_sets = len(known_store.list_sets())
+                    if n_sets:
+                        w.log.emit(f"Known-file filtering ON — "
+                                   f"{n_sets} hash set(s), "
+                                   f"{known_store.total_hashes():,} hashes")
+                    else:
+                        known_store = None
+                        w.log.emit("[warn] known-file filtering requested but "
+                                   "no hash sets are imported (Known Files "
+                                   "tab) — every file will be treated as "
+                                   "unknown")
+                except Exception as exc:  # noqa: BLE001
+                    known_store = None
+                    w.log.emit(f"[warn] known-file store unavailable: {exc}")
             n_hash_skipped = 0        # files too large to hash fully
             n_artifacts = 0           # specialized containers parsed
             n_artifact_items = 0      # sub-docs from those containers
@@ -1482,6 +1528,16 @@ class IngestPanel(QWidget):
                                 extract_stats.get(result.extractor, 0) + 1
                     content = None            # free the raw bytes now
 
+                    known_name = None
+                    if known_store is not None and (sha256 or md5):
+                        try:
+                            known_name = known_store.lookup(
+                                md5=md5 or "", sha256=sha256 or "")
+                        except Exception:  # noqa: BLE001
+                            known_name = None
+                        if known_name:
+                            n_known += 1
+
                     row = {
                         "inode": rec.inode, "path": rec.path, "name": rec.name,
                         "size_bytes": rec.size_bytes,
@@ -1491,6 +1547,7 @@ class IngestPanel(QWidget):
                         "ads_name": rec.ads_name,
                         "vss_snapshot_id": rec.vss_snapshot_id,
                         "md5": md5, "sha256": sha256, "tlsh": tlsh,
+                        "known_set": known_name,
                         # Provenance for a later export back out of the image.
                         "volume_offset": rec.volume_offset,
                         "volume_label": rec.volume_label,
@@ -1618,6 +1675,17 @@ class IngestPanel(QWidget):
                 if writer is not None:
                     writer.commit()
 
+            if known_store is not None:
+                pct = (100.0 * n_known / n_hashed) if n_hashed else 0.0
+                w.log.emit(
+                    f"  known files: {n_known:,} of {n_hashed:,} hashed "
+                    f"files matched an imported hash set ({pct:.1f}%) — "
+                    f"labelled only, nothing removed")
+                case.log("ingest.known_files",
+                         {"evidence_id": ev_id, "matched": n_known,
+                          "hashed": n_hashed,
+                          "sets": [x.name for x in known_store.list_sets()]})
+
             if do_hash:
                 w.log.emit(f"  per-file hashing: {n_hashed} hashed, "
                            f"{n_hash_skipped} skipped (larger than "
@@ -1642,6 +1710,7 @@ class IngestPanel(QWidget):
                 "walk_truncated": walk_truncated,
                 "content_extracted": n_extracted,
                 "files_hashed": n_hashed,
+                "files_known": n_known,
                 "hash_skipped_oversize": n_hash_skipped,
                 "artifacts_parsed": n_artifacts,
                 "artifact_items": n_artifact_items,

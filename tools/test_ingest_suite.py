@@ -397,6 +397,79 @@ def run(img_path: str) -> int:
     check("evidence row recorded", len(case.list_evidence()) == 1)
 
     # ================================================================
+    section("AFTER — known-file hash sets")
+    # ================================================================
+    from app.core.known_files import KnownSetStore, normalise_hash
+    kstore = KnownSetStore(root / "known.db")
+    check("MD5/SHA-1/SHA-256 all recognised",
+          normalise_hash("d41d8cd98f00b204e9800998ecf8427e")[0] == "md5"
+          and normalise_hash("a" * 40)[0] == "sha1"
+          and normalise_hash("b" * 64)[0] == "sha256")
+    check("a non-hex string of hash length is rejected",
+          normalise_hash("z" * 64) is None)
+
+    # Build a hash set out of this image's own file hashes, so the
+    # labelling path is exercised on real data from the image under test.
+    with case.connect() as conn:
+        real = [r[0] for r in conn.execute(
+            "SELECT sha256 FROM files WHERE sha256 IS NOT NULL AND "
+            "sha256 != '' ORDER BY path LIMIT 20").fetchall()]
+    if real:
+        lp = root / "seed_hashes.txt"
+        lp.write_text("\n".join(real), encoding="utf-8")
+        n_imp = kstore.import_hash_list(lp, "SuiteSeed")
+        check("hash list imports", n_imp == len(real),
+              f"{n_imp} of {len(real)}")
+        check("a seeded hash is found", kstore.lookup(sha256=real[0])
+              == "SuiteSeed")
+        check("an absent hash is not found",
+              kstore.lookup(sha256="f" * 64) is None)
+        check("set is listed with its count",
+              any(x.name == "SuiteSeed" and x.n_hashes == n_imp
+                  for x in kstore.list_sets()))
+        check("deleting a set removes its matches",
+              kstore.delete_set("SuiteSeed")
+              and kstore.lookup(sha256=real[0]) is None)
+    else:
+        check("image produced hashes to seed a set with", False,
+              "no hashed files")
+
+    # An RDSv3 publication, built to NIST's published FILE schema.
+    import sqlite3 as _sq
+    rp = root / "rdsv3_probe.db"
+    _c = _sq.connect(rp)
+    _c.executescript(
+        "CREATE TABLE FILE (sha256 VARCHAR NOT NULL, sha1 VARCHAR NOT NULL,"
+        " md5 VARCHAR NOT NULL, crc32 VARCHAR NOT NULL,"
+        " file_name VARCHAR NOT NULL, file_size INTEGER NOT NULL,"
+        " package_id INTEGER NOT NULL);")
+    _c.execute("INSERT INTO FILE VALUES (?,?,?,?,?,?,?)",
+               ("a" * 64, "b" * 40, "c" * 32, "0", "stock.dll", 10, 1))
+    _c.commit(); _c.close()
+    rinfo = kstore.inspect_nsrl(rp)
+    check("RDSv3 publication is recognised by schema", rinfo["ok"],
+          rinfo["note"])
+    check("RDSv3 hash columns detected",
+          set(rinfo.get("hash_columns", [])) == {"sha256", "sha1", "md5"},
+          str(rinfo.get("hash_columns")))
+    before_rds = sha256_file(rp)
+    n_rds = kstore.import_nsrl(rp, "RDSProbe", algos=("sha256", "md5"))
+    check("RDSv3 import reads the requested algos", n_rds == 2, str(n_rds))
+    check("RDSv3 publication is opened read-only and unchanged",
+          sha256_file(rp) == before_rds)
+    check("a file in the RDS set is found", kstore.lookup(sha256="a" * 64)
+          == "RDSProbe")
+    check("an algo that was not imported does not match",
+          kstore.lookup(sha1="b" * 40) is None,
+          "sha1 was excluded from the import")
+    check("a SQLite file without a FILE table is rejected",
+          not kstore.inspect_nsrl(case.db_path)["ok"])
+
+    check("hide-known is a view option, OFF by default",
+          not SearchPanel().chk_hide_known.isChecked(),
+          "a filter that hides evidence must never be the default")
+
+    # ================================================================
     section("AFTER — search, every mode")
     # ================================================================
     sp = SearchPanel()

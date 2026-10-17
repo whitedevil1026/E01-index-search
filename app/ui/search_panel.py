@@ -39,6 +39,8 @@ class SearchPanel(QWidget):
         self._last_results: list = []   # rows from the last search, for export
         self._last_mode: str = ""
         self._sel_prov = None           # provenance of the selected row
+        self._known_cache: dict = {}    # (evidence_uuid, path) -> is_known
+        self._last_hidden = 0           # rows the known-file filter hid
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 20, 20, 20)
@@ -110,6 +112,20 @@ class SearchPanel(QWidget):
         self.spin_dist.setVisible(False)
         bar.addWidget(self.lbl_dist)
         bar.addWidget(self.spin_dist)
+
+        self.chk_hide_known = QCheckBox("Hide known files")
+        self.chk_hide_known.setChecked(False)
+        self.chk_hide_known.setToolTip(
+            "Leave out results whose hash matched an imported hash set "
+            "(NSRL and friends) during ingest.\n\n"
+            "Off by default, deliberately. A hash set says a file shipped "
+            "with some product, not that it is innocent — attackers use "
+            "signed vendor binaries, and those are in NSRL too.\n\n"
+            "When on, the status line always states how many results were "
+            "hidden, so a filtered list is never mistaken for the whole "
+            "set. Nothing is deleted; this only affects the view."
+        )
+        bar.addWidget(self.chk_hide_known)
 
         bar.addWidget(QLabel("Limit:"))
         self.limit = QSpinBox()
@@ -305,6 +321,7 @@ class SearchPanel(QWidget):
                      "Install tantivy-py to enable search.")
             return
 
+        self._known_cache.clear()
         self._set_status(f"Working — searching '{q}'…", "working")
         self.btn.setEnabled(False)
         self.btn_export.setEnabled(False)
@@ -322,6 +339,21 @@ class SearchPanel(QWidget):
 
         dt_ms = (time.time() - t0) * 1000
         self.btn.setEnabled(True)
+
+        # Optionally leave out vendor-shipped files. This filters the
+        # VIEW only — the documents stay in the index and the rows stay
+        # in the database — and the count hidden is always reported, so
+        # a filtered list is never mistaken for the complete one.
+        n_hidden = 0
+        if self.chk_hide_known.isChecked() and hits:
+            kept = []
+            for h in hits:
+                if self._is_known(h.path, h.evidence_uuid):
+                    n_hidden += 1
+                else:
+                    kept.append(h)
+            hits = kept
+        self._last_hidden = n_hidden
 
         # ---- render (Score / Path / Name / Size / Encoding / SHA-256) --
         self.tbl.setHorizontalHeaderLabels(
@@ -391,13 +423,13 @@ class SearchPanel(QWidget):
             self._set_status(
                 f"<b>{len(hits)} hit(s)</b> via fallback query "
                 f"<code>{query_used}</code> across {segments_searched} segment(s) "
-                f"({dt_ms:.0f} ms).",
+                f"({dt_ms:.0f} ms).{self._hidden_note()}",
                 "ok",
             )
         else:
             self._set_status(
                 f"<b>{len(hits)} hit(s)</b> across {segments_searched} index segment(s) "
-                f"({dt_ms:.0f} ms).",
+                f"({dt_ms:.0f} ms).{self._hidden_note()}",
                 "ok",
             )
 
@@ -637,6 +669,37 @@ class SearchPanel(QWidget):
                  f"Wrote {len(self._last_results)} rows to:\n{p}")
 
     # ---- provenance / extraction -------------------------------------
+
+    def _hidden_note(self) -> str:
+        """State what the known-file filter removed from this view.
+
+        A filtered result list that does not say it is filtered is
+        indistinguishable from a complete one, which is how evidence
+        gets overlooked.
+        """
+        n = getattr(self, "_last_hidden", 0)
+        if not n:
+            return ""
+        return (f" &nbsp;<b>{n} known file(s) hidden</b> — untick "
+                f"<i>Hide known files</i> to see them.")
+
+    def _is_known(self, path: str, evidence_uuid: str = "") -> bool:
+        """Did this file match a known-file hash set at ingest time?"""
+        if not self.case:
+            return False
+        key = (evidence_uuid, path)
+        cached = self._known_cache.get(key)
+        if cached is not None:
+            return cached
+        ev_id = None
+        if evidence_uuid:
+            row = self.case.evidence_by_uuid(evidence_uuid)
+            if row:
+                ev_id = row["id"]
+        frow = self.case.file_by_path(path, ev_id)
+        val = bool(frow and (frow.get("known_set") or ""))
+        self._known_cache[key] = val
+        return val
 
     def _evidence_label(self, evidence_uuid: str = "",
                         evidence_id=None) -> str:

@@ -1,5 +1,40 @@
 # Running a real case
 
+> ## BLOCKER — check this first (verified 2026-10-18)
+>
+> **This build pins Python 3.10, and Python 3.10 reaches end of life on
+> 31 October 2026.** The bundled wheels in `wheels/` are `cp310` only, so
+> the offline installer works on nothing else.
+>
+> On the development machine Python 3.10 has already been removed —
+> only 3.12 and 3.14 are present, and 17 of the 20 forensic
+> dependencies are absent from both. **The tool cannot run there as
+> shipped.** Confirm `python -c "import sys; print(sys.version)"` reports
+> 3.10 before relying on this build, or migrate first.
+>
+> ### Migration to Python 3.12 is viable — verified against PyPI
+>
+> | Dependency | cp312 binary wheel |
+> |---|---|
+> | `libewf-python` | yes — `20260924-cp312-cp312-win_amd64` |
+> | `pytsk3` | yes — `20260715-cp312` |
+> | `tantivy` | yes — `0.26.2-cp312` |
+> | `yara-x` | yes — `1.21.0-cp38-abi3` (any 3.8+) |
+> | `cryptography` | yes — `50.0.2-cp311-abi3` (any 3.11+) |
+> | `libfsntfs-python` | yes — `20260827` |
+> | **`py-tlsh`** | **no — sdist only** |
+>
+> `py-tlsh` is the single gap. There is a `tlsh 0.2.0` wheel on PyPI that
+> looks like a drop-in, but it is **empty** — dist-info with no module —
+> so it is not a substitute. Either build `py-tlsh` from source (needs
+> MSVC build tools, which breaks this project's no-build-tools promise)
+> or run without it: TLSH is already optional (`HAS_TLSH`) and only
+> fuzzy-similarity search is lost.
+>
+> Python 3.12 is supported to October 2028. `tools/build_wheels.py`
+> rebuilds the offline bundle for another interpreter.
+
+
 Preflight, settings and expected timings for using this tool on live
 evidence. Figures are measured on this build, not estimated — see
 "Where these numbers come from" at the end.
@@ -164,3 +199,44 @@ Measured on this build against `drive1.E01` (1.06 GB) and
 Throughput on your hardware and on denser evidence will differ —
 re-measure with the suite on a representative image before quoting a
 completion time to anyone.
+
+---
+
+## 7. Known-file hash sets (NSRL)
+
+Separates files that shipped with the operating system or an
+application from files that were put on the machine. Usually the first
+question worth asking, and it cuts the volume an examiner has to read.
+
+**Import once, in the Known Files tab.** Sets live in `known_sets.db`
+beside the application, not inside a case, so one import serves every
+later case. Override the location with `E01_KNOWN_SETS_DB`.
+
+| Source | Use |
+|---|---|
+| **NSRL RDSv3 (SQLite)** | NIST retired the old RDS 2.xx text format. Prefer the **minimal** publication: same `FILE` view (sha256, sha1, md5, name, size) at a fraction of the size — a full Modern set runs to hundreds of GB unzipped. Opened read-only; only the hash columns are copied. |
+| **Plain hash list (.txt)** | One hash per line, MD5/SHA-1/SHA-256 mixed freely, `#` comments and trailing filenames (as `md5sum` writes) tolerated. Needs no network — the universal path. |
+| **CSV** | Any delimited file whose header names `md5`, `sha1` or `sha256`. |
+
+Then tick **"Flag known files"** on the Ingest tab (on by default; it
+needs per-file hashing). The log reports how many matched, and
+`ingest.known_files` records it in the audit log.
+
+### A match labels; it never deletes
+
+Nothing is removed from the index or the case database — only labelled
+with the set that matched. This is deliberate:
+
+* A hash set is not a statement of innocence. Attackers run signed
+  vendor binaries (`certutil.exe`, `psexec.exe`) as the attack, and
+  those are in NSRL.
+* A set can be stale, and a file altered by one byte stops matching.
+
+**"Hide known files"** in Search is a view option, **off by default**,
+and whenever it is on the status line states how many rows it hid.
+
+Probabilistic filters are deliberately unsupported for this. CIRCL
+publishes a ~700 MB Bloom filter of the NSRL SHA-1 space, which is
+tempting for size, but a Bloom filter has false positives by
+construction — it can call a suspect's file "known". That is exactly
+the error that loses evidence, so only exact hash sets are accepted.

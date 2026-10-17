@@ -67,7 +67,10 @@ CREATE TABLE IF NOT EXISTS files (
     volume_offset INTEGER,       -- volume start, from the image start
     volume_label TEXT,           -- 'vol1', 'vol1/vss2', ...
     fs_backend TEXT,             -- tsk / fsntfs / fsapfs
-    data_offset INTEGER          -- carved files: absolute image offset
+    data_offset INTEGER,         -- carved files: absolute image offset
+    -- Name of the known-file hash set this file matched, if any.
+    -- A label only: a match never removes the row (see known_files).
+    known_set TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_files_evidence ON files(evidence_id);
 CREATE INDEX IF NOT EXISTS idx_files_sha256 ON files(sha256);
@@ -127,6 +130,7 @@ _FILES_ADDED_COLUMNS = (
     ("volume_label", "TEXT"),
     ("fs_backend", "TEXT"),
     ("data_offset", "INTEGER"),
+    ("known_set", "TEXT"),
 )
 
 
@@ -288,15 +292,16 @@ class Case:
                     "INSERT INTO files(evidence_id, inode, path, name, size_bytes, "
                     "mtime, atime, ctime, crtime, md5, sha256, tlsh, "
                     "is_allocated, ads_name, vss_snapshot_id, "
-                    "volume_offset, volume_label, fs_backend, data_offset) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "volume_offset, volume_label, fs_backend, data_offset, known_set) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (evidence_id, r.get("inode"), r["path"], r["name"], r.get("size_bytes"),
                      r.get("mtime"), r.get("atime"), r.get("ctime"), r.get("crtime"),
                      r.get("md5"), r.get("sha256"), r.get("tlsh"),
                      1 if r.get("is_allocated", True) else 0,
                      r.get("ads_name"), r.get("vss_snapshot_id"),
                      r.get("volume_offset"), r.get("volume_label"),
-                     r.get("fs_backend"), r.get("data_offset")),
+                     r.get("fs_backend"), r.get("data_offset"),
+                     r.get("known_set")),
                 )
                 n += 1
             conn.execute("COMMIT")
@@ -349,6 +354,22 @@ class Case:
         cols = ["id", "evidence_id", "kind", "subtype", "value", "count",
                 "first_offset", "added_at"]
         return [dict(zip(cols, r)) for r in rows]
+
+    def count_known(self) -> tuple[int, int]:
+        """(files matching a known-file hash set, files with a hash).
+
+        Lets the UI say what proportion of the drive is stock vendor
+        content, and state plainly how many rows a "hide known" view is
+        hiding rather than quietly shrinking the list.
+        """
+        with self.connect() as conn:
+            known = int(conn.execute(
+                "SELECT COUNT(*) FROM files WHERE known_set IS NOT NULL "
+                "AND known_set != ''").fetchone()[0] or 0)
+            hashed = int(conn.execute(
+                "SELECT COUNT(*) FROM files WHERE sha256 IS NOT NULL "
+                "AND sha256 != ''").fetchone()[0] or 0)
+        return known, hashed
 
     def count_findings(self, kind: str | None = None,
                        subtype: str | None = None,
@@ -417,7 +438,7 @@ class Case:
         search hit back to the provenance needed to export it."""
         q = ("SELECT id, evidence_id, inode, path, name, size_bytes, md5, "
              "sha256, tlsh, is_allocated, vss_snapshot_id, volume_offset, "
-             "volume_label, fs_backend, data_offset FROM files WHERE path = ?")
+             "volume_label, fs_backend, data_offset, known_set FROM files WHERE path = ?")
         params: list[Any] = [path]
         if evidence_id is not None:
             q += " AND evidence_id = ?"
@@ -429,7 +450,8 @@ class Case:
             return None
         cols = ["id", "evidence_id", "inode", "path", "name", "size_bytes",
                 "md5", "sha256", "tlsh", "is_allocated", "vss_snapshot_id",
-                "volume_offset", "volume_label", "fs_backend", "data_offset"]
+                "volume_offset", "volume_label", "fs_backend", "data_offset",
+                "known_set"]
         return dict(zip(cols, row))
 
     def evidence_by_id(self, evidence_id: int) -> dict | None:
