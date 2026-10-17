@@ -72,3 +72,11 @@ desktop.ini
 
 # Scratch cases written by tools/test_ingest_suite.py
 _suite_work/
+
+# Python 3.12 migration virtualenv (local only)
+.venv312/
+
+# Rebuildable offline bundle for Python 3.12 (122 MB — see requirements.txt).
+# Not committed: wheels/ already carries 114 MB of cp310 wheels and doubling
+# that would make the repo painful to clone. Rebuild with one command.
+wheels312/
