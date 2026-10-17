@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import os
+import sqlite3
 import time
 from pathlib import Path
 
@@ -1379,6 +1380,8 @@ class IngestPanel(QWidget):
             # cases. A match only LABELS the row (see known_files) — it
             # never removes a file from the index or the database.
             known_store = None
+            known_conn = None
+            known_failed = {"hit": False, "why": ""}
             if do_known and KnownSetStore is not None:
                 try:
                     known_store = KnownSetStore(default_store_path())
@@ -1387,6 +1390,19 @@ class IngestPanel(QWidget):
                         w.log.emit(f"Known-file filtering ON — "
                                    f"{n_sets} hash set(s), "
                                    f"{known_store.total_hashes():,} hashes")
+                        partial = [x.name for x in known_store.list_sets()
+                                   if not x.complete]
+                        if partial:
+                            w.log.emit(
+                                f"  [warn] PARTIAL hash set(s) in use "
+                                f"{partial} — these were cancelled or "
+                                f"limited during import, so known-file "
+                                f"coverage is incomplete")
+                        # One connection for the whole run, opened on this
+                        # worker thread. A connection per file measured
+                        # 0.77 ms each: ~25 minutes on a 2M-file image.
+                        known_conn = sqlite3.connect(
+                            known_store.db_path, timeout=30.0)
                     else:
                         known_store = None
                         w.log.emit("[warn] known-file filtering requested but "
@@ -1529,12 +1545,23 @@ class IngestPanel(QWidget):
                     content = None            # free the raw bytes now
 
                     known_name = None
-                    if known_store is not None and (sha256 or md5):
+                    if known_conn is not None and (sha256 or md5):
                         try:
-                            known_name = known_store.lookup(
-                                md5=md5 or "", sha256=sha256 or "")
-                        except Exception:  # noqa: BLE001
-                            known_name = None
+                            known_name = known_store._lookup_on(
+                                known_conn, md5=md5 or "",
+                                sha256=sha256 or "")
+                        except Exception as exc:  # noqa: BLE001
+                            # Reported once, not swallowed: a locked or
+                            # corrupt store would otherwise look like a
+                            # genuine 0% hit rate.
+                            if not known_failed["hit"]:
+                                known_failed["hit"] = True
+                                known_failed["why"] = str(exc)
+                                w.log.emit(
+                                    f"  [warn] known-file lookup failed; "
+                                    f"labelling stopped for the rest of this "
+                                    f"run: {exc}")
+                            known_conn = None
                         if known_name:
                             n_known += 1
 
@@ -1675,7 +1702,19 @@ class IngestPanel(QWidget):
                 if writer is not None:
                     writer.commit()
 
+            if known_conn is not None:
+                try:
+                    known_conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                known_conn = None
+
             if known_store is not None:
+                if known_failed["hit"]:
+                    w.log.emit(
+                        f"  [TRUNCATED] known-file labelling stopped early "
+                        f"({known_failed['why']}) — the {n_known:,} figure "
+                        f"below is a FLOOR, not the total")
                 pct = (100.0 * n_known / n_hashed) if n_hashed else 0.0
                 w.log.emit(
                     f"  known files: {n_known:,} of {n_hashed:,} hashed "
@@ -1684,7 +1723,11 @@ class IngestPanel(QWidget):
                 case.log("ingest.known_files",
                          {"evidence_id": ev_id, "matched": n_known,
                           "hashed": n_hashed,
-                          "sets": [x.name for x in known_store.list_sets()]})
+                          "sets": [x.name for x in known_store.list_sets()],
+                          "lookup_failed": known_failed["hit"],
+                          "partial_sets": [x.name for x in
+                                           known_store.list_sets()
+                                           if not x.complete]})
 
             if do_hash:
                 w.log.emit(f"  per-file hashing: {n_hashed} hashed, "

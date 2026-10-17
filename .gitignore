@@ -80,3 +80,12 @@ _suite_work/
 # Not committed: wheels/ already carries 114 MB of cp310 wheels and doubling
 # that would make the repo painful to clone. Rebuild with one command.
 wheels312/
+
+# Local known-file hash store — reference data, not source. Rebuilt by
+# importing hash sets in the Known Files tab; can reach many GB.
+known_sets.db
+known_sets.db-wal
+known_sets.db-shm
+
+# Suite output files
+run[0-9]*.txt

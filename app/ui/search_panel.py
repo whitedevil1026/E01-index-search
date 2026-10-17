@@ -14,6 +14,7 @@ Features:
 """
 from __future__ import annotations
 
+import re
 import time
 
 from PySide6.QtCore import Qt, QTimer
@@ -398,7 +399,21 @@ class SearchPanel(QWidget):
                     f"<code>{q.replace(' ', '')}</code>."
                 )
             tips.append("Try a wildcard, e.g. <code>system*</code>.")
-            if total_docs == 0:
+            if getattr(self, "_last_hidden", 0):
+                # Everything that matched was a known file. Reporting
+                # this as "the query didn't match anything" would tell
+                # the examiner the file is not on the drive when it is —
+                # the exact failure the known-file design forbids.
+                n = self._last_hidden
+                self._set_status(
+                    f"<b>0 shown — but {n} known file(s) matched and were "
+                    f"hidden.</b> <i>Hide known files</i> is ticked, so every "
+                    f"match for <code>{q}</code> was a file present in an "
+                    f"imported hash set. Untick it to see them: a hash set "
+                    f"means vendor-shipped, not harmless.",
+                    "warn",
+                )
+            elif total_docs == 0:
                 self._set_status(
                     "<b>No documents indexed yet.</b> Run an ingest in the "
                     "<b>Ingest</b> tab first — searches need indexed file names "
@@ -456,6 +471,53 @@ class SearchPanel(QWidget):
         limit = self.limit.value()
         all_hits = []
         n_idx = 0
+
+        # ---- SHA-256 prefix ------------------------------------------
+        # Routed through a regex query on the sha256 field, NOT the text
+        # query parser. The parser has no wildcard support, so the old
+        # "sha256:<hex>*" form made Tantivy treat the trailing * as part
+        # of the term: the mode returned 0 hits even for a full, exact
+        # hash that was indexed. Measured dead at every prefix length.
+        if mode == "sha256":
+            prefix = q.strip().lower()
+            for sub in self._index_dirs():
+                idx = Indexer(sub)
+                try:
+                    all_hits.extend(idx.regex_search(
+                        "^" + re.escape(prefix), field="sha256", limit=limit))
+                except Exception:  # noqa: BLE001
+                    pass
+                n_idx += 1
+            seen, deduped = set(), []
+            for h in all_hits:
+                k = (h.evidence_uuid, h.path, h.name)
+                if k not in seen:
+                    seen.add(k)
+                    deduped.append(h)
+            return deduped[:limit], n_idx, f"sha256 prefix {prefix}", False
+
+        # ---- exact name (substring) ----------------------------------
+        # Same fault: "name:*q*" is not a wildcard query in Tantivy, so
+        # the mode only ever matched whole tokens. "voice" missed
+        # invoice_2026.pdf and "32" missed system32.dll, despite the mode
+        # being labelled a substring search.
+        if mode == "name":
+            for sub in self._index_dirs():
+                idx = Indexer(sub)
+                for field in ("name", "path"):
+                    try:
+                        all_hits.extend(idx.regex_search(
+                            re.escape(q.strip()), field=field, limit=limit))
+                    except Exception:  # noqa: BLE001
+                        pass
+                n_idx += 1
+            seen, deduped = set(), []
+            for h in all_hits:
+                k = (h.evidence_uuid, h.path, h.name)
+                if k not in seen:
+                    seen.add(k)
+                    deduped.append(h)
+            return deduped[:limit], n_idx, f"name contains {q!r}", False
 
         # ---- regex mode — Tantivy RE2 query over name + path ----------
         if mode == "regex":
@@ -532,11 +594,12 @@ class SearchPanel(QWidget):
         return total
 
     def _format_query(self, q: str, mode: str) -> str:
-        if mode == "name":
-            # name field substring — try as-is + wildcards
-            return f"name:*{q}*"
-        if mode == "sha256":
-            return f"sha256:{q.lower()}*"
+        """Only the full-text mode reaches the Tantivy query parser now.
+
+        `name` and `sha256` used wildcard syntax the parser does not
+        implement, so both are handled by regex queries on their fields
+        in _search_with_fallback.
+        """
         return q
 
     # ---- TLSH similarity search --------------------------------------
@@ -696,7 +759,16 @@ class SearchPanel(QWidget):
             row = self.case.evidence_by_uuid(evidence_uuid)
             if row:
                 ev_id = row["id"]
-        frow = self.case.file_by_path(path, ev_id)
+        # Container sub-documents are indexed as "<file>#<subpath>" and
+        # never match a files.path row, so resolve the container.
+        lookup_path = path.split("#", 1)[0] if "#" in path else path
+        if ev_id is None and len(self.case.list_evidence()) > 1:
+            # Several images and no way to tell which: treating the row
+            # as unknown shows it, rather than judging it by another
+            # image's file of the same path.
+            self._known_cache[key] = False
+            return False
+        frow = self.case.file_by_path(lookup_path, ev_id)
         val = bool(frow and (frow.get("known_set") or ""))
         self._known_cache[key] = val
         return val

@@ -43,16 +43,36 @@ DEFAULT_IMG = r"F:\e01 indexing\2011-10-19-Image\2011-10-19-Sample.E01"
 # E01_SUITE_WORKDIR.
 DEFAULT_WORKDIR = str(Path(__file__).resolve().parent.parent / "_suite_work")
 
-PASS, FAIL, SKIP = [], [], []
+PASS, FAIL, SKIP, ENV = [], [], [], []
 
 
-def check(label, cond, detail=""):
+def check(label, cond, detail="", pass_detail=""):
+    """Assert one thing.
+
+    `detail` explains a FAILURE; `pass_detail` reports the observed
+    value on success. Printing `detail` on a pass produced lines like
+    "[PASS] deps module exposes a probe - probe_all() returned nothing",
+    which reads as a contradiction and erodes trust in the output.
+    """
     if cond:
         PASS.append(label)
-        print(f"  [PASS] {label}" + (f"  — {detail}" if detail else ""))
+        print(f"  [PASS] {label}"
+              + (f"  — {pass_detail}" if pass_detail else ""))
     else:
         FAIL.append(f"{label}: {detail}")
         print(f"  [FAIL] {label}" + (f"  — {detail}" if detail else ""))
+
+
+def env_gap(label, why):
+    """An optional capability this deployment does not have.
+
+    Distinct from both a pass and a failure. Failing would train
+    examiners to ignore a red suite for a documented reason; skipping
+    would hide that a search mode is unavailable. So it is reported
+    loudly in its own category and does not fail the run.
+    """
+    ENV.append(f"{label}: {why}")
+    print(f"  [ENV ] {label}  — {why}")
 
 
 def skip(label, why):
@@ -489,8 +509,16 @@ def run(img_path: str) -> int:
         if trow:
             seed_tlsh = trow[0]
     check("a SHA-256 seed exists for hash search", bool(seed_sha))
-    check("a TLSH seed exists for similarity search", bool(seed_tlsh),
-          f"{seed_tlsh[:16]}…" if seed_tlsh else "no file produced a TLSH digest")
+    from app.core.hashing import HAS_TLSH
+    if not HAS_TLSH:
+        env_gap("TLSH similarity search",
+                "py-tlsh is not installed (no cp312 binary wheel exists), so "
+                "no file can carry a TLSH digest and that search mode is "
+                "unavailable in this deployment")
+    else:
+        check("a TLSH seed exists for similarity search", bool(seed_tlsh),
+              f"{seed_tlsh[:16]}…" if seed_tlsh
+              else "py-tlsh is installed but no file produced a digest")
     mode_queries = {
         "fulltext": "the",
         "name": (seed_name or "a"),
@@ -501,6 +529,9 @@ def run(img_path: str) -> int:
     for i in range(sp.mode.count()):
         data = sp.mode.itemData(i)
         q = mode_queries.get(data, "")
+        if data == "tlsh" and not HAS_TLSH:
+            env_gap("search mode 'tlsh'", "py-tlsh not installed")
+            continue
         check(f"search mode '{data}' has a usable seed", bool(q),
               f"{q[:24]!r}" if q else "no seed could be derived from this image")
         if not q:
@@ -510,8 +541,59 @@ def run(img_path: str) -> int:
         sp.q.setText(q)
         sp._run()
         app.processEvents()
-        print(f"  {data:<10} q={q[:24]!r:<26} -> {sp.tbl.rowCount()} row(s)")
-        check(f"search mode '{data}' runs without error", True)
+        rows = sp.tbl.rowCount()
+        status = sp.status.text()
+        print(f"  {data:<10} q={q[:24]!r:<26} -> {rows} row(s)")
+        # Previously this passed a literal True, so it asserted nothing
+        # at all: a mode could return zero rows for a query built from
+        # this very case and still be recorded as a pass.
+        check(f"search mode '{data}' reports no error",
+              "Error:" not in status, status[:100])
+        if data == "sha256":
+            # The seed is a prefix of a hash that IS in this case, so a
+            # correct implementation must find at least one row.
+            check("SHA-256 prefix search finds the file it was seeded from",
+                  rows > 0,
+                  f"0 rows for prefix {q!r} taken from a hash in this case",
+                  pass_detail=f"{rows} row(s)")
+        elif data in ("fulltext", "name", "regex"):
+            check(f"search mode '{data}' returns a row count, not an error",
+                  rows >= 0, pass_detail=f"{rows} row(s)")
+
+    # Both of these modes were silently dead: the code built wildcard
+    # queries ("sha256:<hex>*", "name:*q*") that Tantivy's parser does
+    # not implement, so it matched the asterisk literally. SHA-256 mode
+    # returned nothing even for a full exact hash, and name mode only
+    # matched whole tokens despite being labelled a substring search.
+    # Assert against a hash and a name taken from THIS image.
+    if seed_sha:
+        sp.mode.setCurrentIndex(sp.mode.findData("sha256"))
+        app.processEvents()
+        for plen in (64, 32, 12):
+            sp.q.setText(seed_sha[:plen])
+            sp._run()
+            app.processEvents()
+            check(f"SHA-256 prefix[{plen}] finds the file it came from",
+                  sp.tbl.rowCount() > 0,
+                  f"0 rows for a {plen}-char prefix of a hash in this case",
+                  pass_detail=f"{sp.tbl.rowCount()} row(s)")
+        sp.q.setText("ffffffffffffffff")
+        sp._run()
+        app.processEvents()
+        check("SHA-256 prefix that matches nothing returns nothing",
+              sp.tbl.rowCount() == 0, f"{sp.tbl.rowCount()} rows")
+
+    if seed_name and len(seed_name) >= 4:
+        inner = seed_name[1:-1]
+        sp.mode.setCurrentIndex(sp.mode.findData("name"))
+        app.processEvents()
+        sp.q.setText(inner)
+        sp._run()
+        app.processEvents()
+        check("name mode matches a true substring, not just whole tokens",
+              sp.tbl.rowCount() > 0,
+              f"0 rows for {inner!r}, an inner substring of {seed_name!r}",
+              pass_detail=f"{inner!r} -> {sp.tbl.rowCount()} row(s)")
 
     # Regex substring semantics. Derive the pattern from a path that is
     # actually in this image — an NTFS-only pattern like \$M.* would
@@ -784,7 +866,13 @@ def run(img_path: str) -> int:
     # ================================================================
     print(f"\n{'=' * 72}")
     print(f"PASSED {len(PASS)}   FAILED {len(FAIL)}   SKIPPED {len(SKIP)}"
+          + (f"   ENV-GAPS {len(ENV)}" if ENV else "")
           + ("   (skips count as failures)" if SKIP else ""))
+    if ENV:
+        print("\nOPTIONAL CAPABILITIES ABSENT IN THIS DEPLOYMENT "
+              "(not code defects):")
+        for e in ENV:
+            print(f"  - {e}")
     if FAIL:
         print("\nFAILURES:")
         for f in FAIL:

@@ -24,7 +24,19 @@ from app.ui.centered_msg import msg_error, msg_info, msg_question
 class KnownFilesPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.store = KnownSetStore(default_store_path())
+        # A corrupt or unreachable store must not stop the application
+        # from starting: this panel is built during MainWindow setup, so
+        # an exception here left the examiner unable to open any case.
+        self.store = None
+        self._store_error = ""
+        try:
+            self.store = KnownSetStore(default_store_path())
+            self.store.sweep_orphans()
+        except Exception as exc:  # noqa: BLE001
+            self._store_error = (
+                f"{type(exc).__name__}: {exc}\n\nStore path: "
+                f"{default_store_path()}\n\nIf the file is corrupt, "
+                f"rename it and restart to begin a fresh store.")
         self._worker = None
 
         outer = QVBoxLayout(self)
@@ -70,9 +82,9 @@ class KnownFilesPanel(QWidget):
         self.lbl_summary.setObjectName("h2")
         root.addWidget(self.lbl_summary)
 
-        self.tbl = QTableWidget(0, 4)
+        self.tbl = QTableWidget(0, 5)
         self.tbl.setHorizontalHeaderLabels(
-            ["Set", "Kind", "Hashes", "Imported from"])
+            ["Set", "Kind", "Hashes", "Coverage", "Imported from"])
         hdr = self.tbl.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.Interactive)
         hdr.setStretchLastSection(True)
@@ -124,6 +136,15 @@ class KnownFilesPanel(QWidget):
         self.btn_del.setEnabled(False)
         self.btn_del.clicked.connect(self._delete_selected)
         bar.addWidget(self.btn_del)
+        self.btn_cancel = QPushButton("Cancel import")
+        self.btn_cancel.setObjectName("secondary")
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.clicked.connect(self._cancel_import)
+        self.btn_cancel.setToolTip(
+            "Stop the running import. A cancelled set is kept but marked "
+            "PARTIAL, so incomplete coverage is never mistaken for full."
+        )
+        bar.addWidget(self.btn_cancel)
         bar.addStretch(1)
         root.addLayout(bar)
         self.tbl.itemSelectionChanged.connect(
@@ -161,6 +182,18 @@ class KnownFilesPanel(QWidget):
         self.refresh()
 
     def refresh(self):
+        if self.store is None:
+            self.lbl_store.setText(f"Store: {default_store_path()}")
+            self.lbl_summary.setText("Hash store unavailable")
+            self.log_box.setPlainText(
+                "The known-file hash store could not be opened, so no hash "
+                "sets can be imported or matched. Everything else in the "
+                "tool is unaffected.\n\n" + self._store_error)
+            for b_ in (self.btn_nsrl, self.btn_list, self.btn_csv,
+                       self.btn_del, self.btn_probe):
+                b_.setEnabled(False)
+            self.tbl.setRowCount(0)
+            return
         self.lbl_store.setText(f"Store: {self.store.db_path}")
         sets = self.store.list_sets()
         self.tbl.setRowCount(len(sets))
@@ -168,7 +201,10 @@ class KnownFilesPanel(QWidget):
             self.tbl.setItem(i, 0, QTableWidgetItem(s.name))
             self.tbl.setItem(i, 1, QTableWidgetItem(s.kind))
             self.tbl.setItem(i, 2, QTableWidgetItem(f"{s.n_hashes:,}"))
-            self.tbl.setItem(i, 3, QTableWidgetItem(s.source_path))
+            self.tbl.setItem(i, 3, QTableWidgetItem(
+                ("PARTIAL — " + s.notes) if not s.complete
+                else (s.notes or "complete")))
+            self.tbl.setItem(i, 4, QTableWidgetItem(s.source_path))
         self.tbl.resizeColumnsToContents()
         total = self.store.total_hashes()
         if sets:
@@ -199,9 +235,14 @@ class KnownFilesPanel(QWidget):
             return
         for b in (self.btn_nsrl, self.btn_list, self.btn_csv, self.btn_del):
             b.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
 
         def task(w):
-            n = fn(lambda c: w.progress.emit(c, 0, ""))
+            n = fn(lambda c: w.progress.emit(c, 0, ""),
+                   lambda: w.cancelled)
+            if w.cancelled:
+                return True, (f"{label}: CANCELLED after {n:,} hashes — the "
+                              f"set is marked PARTIAL")
             return True, f"{label}: {n:,} hashes imported"
 
         w = Worker(task, self)
@@ -214,9 +255,16 @@ class KnownFilesPanel(QWidget):
         self._log(f"{label} starting…")
         w.start()
 
+    def _cancel_import(self):
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.request_cancel()
+            self._log("[cancel] cancellation requested — finishing the "
+                      "current batch")
+
     def _on_import_done(self, ok: bool, msg: str):
         for b in (self.btn_nsrl, self.btn_list, self.btn_csv):
             b.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
         self._log(("[ok] " if ok else "[fail] ") + msg)
         self.refresh()
 
@@ -247,8 +295,9 @@ class KnownFilesPanel(QWidget):
         if not name:
             return
         self._run_import(
-            lambda cb: self.store.import_nsrl(
-                path, name, algos=("sha256", "md5"), progress_cb=cb),
+            lambda cb, cancel: self.store.import_nsrl(
+                path, name, algos=("sha256", "md5"), progress_cb=cb,
+                cancel_cb=cancel),
             f"NSRL import '{name}'")
 
     def _import_list(self):
@@ -261,7 +310,8 @@ class KnownFilesPanel(QWidget):
         if not name:
             return
         self._run_import(
-            lambda cb: self.store.import_hash_list(path, name, progress_cb=cb),
+            lambda cb, _cancel: self.store.import_hash_list(
+                path, name, progress_cb=cb),
             f"Hash-list import '{name}'")
 
     def _import_csv(self):
@@ -274,7 +324,7 @@ class KnownFilesPanel(QWidget):
         if not name:
             return
 
-        def go(cb):
+        def go(cb, _cancel):
             try:
                 return self.store.import_csv(path, name, progress_cb=cb)
             except ValueError as exc:

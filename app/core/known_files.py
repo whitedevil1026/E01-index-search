@@ -73,6 +73,8 @@ import os
 import re
 import sqlite3
 import time
+import urllib.parse
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -89,6 +91,10 @@ CREATE TABLE IF NOT EXISTS hash_set (
     kind TEXT NOT NULL,          -- nsrl | hashes | csv
     imported_at REAL NOT NULL,
     n_hashes INTEGER NOT NULL DEFAULT 0,
+    -- 0 when the import was cancelled or limited, so a partial set
+    -- can never be mistaken for full coverage.
+    complete INTEGER NOT NULL DEFAULT 1,
+    source_rows INTEGER,
     notes TEXT
 );
 
@@ -112,12 +118,28 @@ class HashSetInfo:
     n_hashes: int
     imported_at: float
     source_path: str = ""
+    complete: bool = True
+    notes: str = ""
 
     def describe(self) -> str:
         when = time.strftime("%Y-%m-%d %H:%M",
                              time.localtime(self.imported_at))
+        flag = "" if self.complete else "  [PARTIAL]"
         return (f"{self.name}  ({self.kind}, {self.n_hashes:,} hashes, "
-                f"imported {when})")
+                f"imported {when}){flag}")
+
+
+def _ro_uri(path: str | Path) -> str:
+    """A read-only SQLite URI for `path`, correctly escaped.
+
+    Raw concatenation was wrong: a `#` in the path starts a URI
+    fragment, so `?mode=ro` was swallowed and never applied — SQLite
+    then opened a DIFFERENT, truncated path read-WRITE and created a
+    file there. A `%` was misread as a percent-escape. Reference data
+    filed under e.g. `NSRL#2024Q3\rds.db` hit both faults.
+    """
+    posix = Path(path).resolve().as_posix()
+    return "file:/" + urllib.parse.quote(posix.lstrip("/"), safe="/:") + "?mode=ro"
 
 
 def normalise_hash(value: str) -> tuple[str, str] | None:
@@ -139,13 +161,54 @@ class KnownSetStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
 
+    # Columns added to hash_set after the first release. CREATE TABLE IF
+    # NOT EXISTS will not add a column to a table that already exists,
+    # so a store written by an earlier build needs them backfilled —
+    # otherwise list_sets() fails with "no such column: complete".
+    _ADDED_COLUMNS = (
+        ("complete", "INTEGER NOT NULL DEFAULT 1"),
+        ("source_rows", "INTEGER"),
+        ("notes", "TEXT"),
+    )
+
+    @classmethod
+    def _migrate(cls, conn) -> None:
+        have = {r[1] for r in conn.execute(
+            "PRAGMA table_info(hash_set)").fetchall()}
+        for name, decl in cls._ADDED_COLUMNS:
+            if name not in have:
+                conn.execute(
+                    f"ALTER TABLE hash_set ADD COLUMN {name} {decl}")
+
+    @contextmanager
     def connect(self):
+        """A closing context manager, mirroring Case.connect().
+
+        The earlier version returned a bare connection, so `with` only
+        wrapped a transaction and the handle was reclaimed by
+        refcounting. foreign_keys is on so that deleting a hash_set row
+        actually cascades to its hashes.
+        """
         conn = sqlite3.connect(self.db_path, isolation_level=None,
                                timeout=30.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        return conn
+        conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def sweep_orphans(self) -> int:
+        """Delete hashes whose set row is gone. Repairs stores written
+        by the earlier INSERT OR REPLACE import path."""
+        with self.connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM known_hash WHERE set_id NOT IN "
+                "(SELECT id FROM hash_set)")
+            return cur.rowcount or 0
 
     # ---- set management ------------------------------------------------
 
@@ -153,14 +216,18 @@ class KnownSetStore:
         with self.connect() as conn:
             rows = conn.execute(
                 "SELECT id, name, kind, n_hashes, imported_at, "
-                "COALESCE(source_path,'') FROM hash_set ORDER BY name"
+                "COALESCE(source_path,''), complete, COALESCE(notes,'') "
+                "FROM hash_set WHERE name NOT LIKE '~staging~%' "
+                "ORDER BY name"
             ).fetchall()
-        return [HashSetInfo(*r) for r in rows]
+        return [HashSetInfo(r[0], r[1], r[2], r[3], r[4], r[5],
+                            bool(r[6]), r[7]) for r in rows]
 
     def total_hashes(self) -> int:
         with self.connect() as conn:
             return int(conn.execute(
-                "SELECT COALESCE(SUM(n_hashes),0) FROM hash_set"
+                "SELECT COALESCE(SUM(n_hashes),0) FROM hash_set "
+                "WHERE name NOT LIKE '~staging~%'"
             ).fetchone()[0] or 0)
 
     def delete_set(self, name: str) -> bool:
@@ -183,20 +250,33 @@ class KnownSetStore:
         SHA-256 is tried first: it is the strongest of the three and the
         one an RDSv3 import indexes most usefully.
         """
-        pairs = [("sha256", sha256), ("sha1", sha1), ("md5", md5)]
-        clauses, params = [], []
-        for algo, val in pairs:
-            n = normalise_hash(val or "")
-            if n:
-                clauses.append("(h.algo=? AND h.hash=?)")
-                params += [n[0], n[1]]
-        if not clauses:
-            return None
-        q = ("SELECT s.name FROM known_hash h JOIN hash_set s "
-             "ON s.id = h.set_id WHERE " + " OR ".join(clauses) + " LIMIT 1")
+        # Queried strongest-first in separate statements. A single OR
+        # with LIMIT 1 left the choice to SQLite's evaluation order, so
+        # which set name got recorded against the evidence could change
+        # with the query planner.
         with self.connect() as conn:
-            row = conn.execute(q, params).fetchone()
-        return row[0] if row else None
+            return self._lookup_on(conn, md5=md5, sha1=sha1, sha256=sha256)
+
+    @staticmethod
+    def _lookup_on(conn, *, md5: str = "", sha1: str = "",
+                   sha256: str = "") -> Optional[str]:
+        """lookup() against a caller-supplied connection.
+
+        Opening a connection per file cost 0.77 ms each — about 25
+        minutes of pure setup on a two-million-file image — so the
+        ingest reuses one connection on its own thread.
+        """
+        for algo, val in (("sha256", sha256), ("sha1", sha1), ("md5", md5)):
+            n = normalise_hash(val or "")
+            if not n:
+                continue
+            row = conn.execute(
+                "SELECT s.name FROM known_hash h JOIN hash_set s "
+                "ON s.id = h.set_id WHERE h.algo=? AND h.hash=? LIMIT 1",
+                (n[0], n[1])).fetchone()
+            if row:
+                return row[0]
+        return None
 
     def lookup_many(self, hashes: Iterable[str]) -> dict[str, str]:
         """{hash: set_name} for those present. One query per 500 hashes."""
@@ -222,66 +302,142 @@ class KnownSetStore:
 
     # ---- import --------------------------------------------------------
 
+    @staticmethod
+    def _flush(conn, batch: list) -> int:
+        """Insert a batch and return how many rows were actually STORED.
+
+        INSERT OR IGNORE drops duplicates, so len(batch) overstates
+        coverage — badly on an NSRL import, where one file appears under
+        many packages. total_changes is the truth.
+        """
+        if not batch:
+            return 0
+        before = conn.total_changes
+        conn.executemany(
+            "INSERT OR IGNORE INTO known_hash(set_id, algo, hash) "
+            "VALUES (?,?,?)", batch)
+        stored = conn.total_changes - before
+        batch.clear()
+        return stored
+
     def _begin_set(self, conn, name: str, kind: str, source: str) -> int:
+        """Create a STAGING set row and return its id.
+
+        The previous version used INSERT OR REPLACE on the real name,
+        which deleted the existing set before the import had produced
+        anything. A failed or killed import therefore destroyed working
+        reference data — an examiner re-importing a new NSRL quarter
+        under the same name lost the old one and was left with a row
+        reading "0 hashes" plus unreachable rows bloating the store.
+        The real name is only taken in _finish_set, after the data is in.
+        """
+        staging = f"~staging~{time.time()}~{name}"
         conn.execute(
-            "INSERT OR REPLACE INTO hash_set(name, source_path, kind, "
-            "imported_at, n_hashes) VALUES (?,?,?,?,0)",
-            (name, source, kind, time.time()))
+            "INSERT INTO hash_set(name, source_path, kind, imported_at, "
+            "n_hashes) VALUES (?,?,?,?,0)",
+            (staging, source, kind, time.time()))
         return int(conn.execute("SELECT id FROM hash_set WHERE name=?",
-                                (name,)).fetchone()[0])
+                                (staging,)).fetchone()[0])
+
+    @staticmethod
+    def _finish_set(conn, set_id: int, name: str, n_stored: int,
+                    complete: bool = True, note: str = "") -> None:
+        """Atomically retire any previous set of this name and promote
+        the staging set into its place."""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            old = conn.execute(
+                "SELECT id FROM hash_set WHERE name=? AND id!=?",
+                (name, set_id)).fetchall()
+            for (oid,) in old:
+                conn.execute("DELETE FROM known_hash WHERE set_id=?", (oid,))
+                conn.execute("DELETE FROM hash_set WHERE id=?", (oid,))
+            conn.execute(
+                "UPDATE hash_set SET name=?, n_hashes=?, complete=?, notes=? "
+                "WHERE id=?",
+                (name, n_stored, 1 if complete else 0, note or None, set_id))
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        conn.execute("COMMIT")
+
+    @staticmethod
+    def _discard_set(conn, set_id: int) -> None:
+        """Drop a staging set after a failed import, leaving whatever
+        was already there untouched."""
+        try:
+            conn.execute("DELETE FROM known_hash WHERE set_id=?", (set_id,))
+            conn.execute("DELETE FROM hash_set WHERE id=?", (set_id,))
+        except Exception:  # noqa: BLE001
+            pass
 
     def import_hash_list(self, path: str | Path, name: str,
                          progress_cb: Optional[Callable[[int], None]] = None
                          ) -> int:
-        """Import a plain one-hash-per-line file. Returns rows inserted."""
+        """Import a plain one-hash-per-line file.
+
+        Returns the number of hashes actually STORED (duplicates in the
+        source are not counted twice).
+        """
         path = Path(path)
-        inserted = 0
+        stored = 0
+        skipped = 0
         with self.connect() as conn:
             set_id = self._begin_set(conn, name, "hashes", str(path))
-            conn.execute("BEGIN")
-            batch: list[tuple] = []
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    # Tolerate `hash  filename` as produced by md5sum.
-                    token = line.split()[0]
-                    n = normalise_hash(token)
-                    if not n:
-                        continue
-                    batch.append((set_id, n[0], n[1]))
-                    if len(batch) >= 20000:
-                        conn.executemany(
-                            "INSERT OR IGNORE INTO known_hash(set_id, algo, "
-                            "hash) VALUES (?,?,?)", batch)
-                        inserted += len(batch)
-                        batch.clear()
-                        if progress_cb:
-                            progress_cb(inserted)
-            if batch:
-                conn.executemany(
-                    "INSERT OR IGNORE INTO known_hash(set_id, algo, hash) "
-                    "VALUES (?,?,?)", batch)
-                inserted += len(batch)
-            conn.execute("COMMIT")
-            conn.execute("UPDATE hash_set SET n_hashes=? WHERE id=?",
-                         (inserted, set_id))
+            try:
+                conn.execute("BEGIN")
+                batch: list[tuple] = []
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        # Tolerate `hash  filename`, as md5sum writes.
+                        n = normalise_hash(line.split()[0])
+                        if not n:
+                            skipped += 1
+                            continue
+                        batch.append((set_id, n[0], n[1]))
+                        if len(batch) >= 20000:
+                            stored += self._flush(conn, batch)
+                            if progress_cb:
+                                progress_cb(stored)
+                stored += self._flush(conn, batch)
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:  # noqa: BLE001
+                    pass
+                self._discard_set(conn, set_id)
+                raise
+            self._finish_set(conn, set_id, name, stored, True,
+                             self._skip_note(skipped))
         if progress_cb:
-            progress_cb(inserted)
-        return inserted
+            progress_cb(stored)
+        return stored
+
+    @staticmethod
+    def _skip_note(skipped: int) -> str:
+        """Unusable source rows are reported, not silently dropped."""
+        return (f"{skipped:,} source rows had no usable MD5/SHA-1/SHA-256"
+                if skipped else "")
 
     def import_csv(self, path: str | Path, name: str,
                    progress_cb: Optional[Callable[[int], None]] = None) -> int:
         """Import a delimited file whose header names a hash column."""
         path = Path(path)
-        inserted = 0
+        stored = 0
+        skipped = 0
         with open(path, "r", encoding="utf-8", errors="replace",
                   newline="") as fh:
             sample = fh.read(8192)
             fh.seek(0)
             try:
-                dialect = _csv.Sniffer().sniff(sample, delimiters=",;\t|")
+                dialect = _csv.Sniffer().sniff(sample, delimiters=",;	|")
             except Exception:  # noqa: BLE001
                 dialect = _csv.excel
             reader = _csv.DictReader(fh, dialect=dialect)
@@ -294,32 +450,34 @@ class KnownSetStore:
                     "use the plain hash-list import instead")
             with self.connect() as conn:
                 set_id = self._begin_set(conn, name, "csv", str(path))
-                conn.execute("BEGIN")
-                batch: list[tuple] = []
-                for row in reader:
-                    for c in cols:
-                        n = normalise_hash((row.get(c) or ""))
-                        if n:
-                            batch.append((set_id, n[0], n[1]))
-                    if len(batch) >= 20000:
-                        conn.executemany(
-                            "INSERT OR IGNORE INTO known_hash(set_id, algo, "
-                            "hash) VALUES (?,?,?)", batch)
-                        inserted += len(batch)
-                        batch.clear()
-                        if progress_cb:
-                            progress_cb(inserted)
-                if batch:
-                    conn.executemany(
-                        "INSERT OR IGNORE INTO known_hash(set_id, algo, "
-                        "hash) VALUES (?,?,?)", batch)
-                    inserted += len(batch)
-                conn.execute("COMMIT")
-                conn.execute("UPDATE hash_set SET n_hashes=? WHERE id=?",
-                             (inserted, set_id))
+                try:
+                    conn.execute("BEGIN")
+                    batch: list[tuple] = []
+                    for row in reader:
+                        for c in cols:
+                            n = normalise_hash(row.get(c) or "")
+                            if n:
+                                batch.append((set_id, n[0], n[1]))
+                            else:
+                                skipped += 1
+                        if len(batch) >= 20000:
+                            stored += self._flush(conn, batch)
+                            if progress_cb:
+                                progress_cb(stored)
+                    stored += self._flush(conn, batch)
+                    conn.execute("COMMIT")
+                except Exception:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._discard_set(conn, set_id)
+                    raise
+                self._finish_set(conn, set_id, name, stored, True,
+                                 self._skip_note(skipped))
         if progress_cb:
-            progress_cb(inserted)
-        return inserted
+            progress_cb(stored)
+        return stored
 
     # ---- NSRL RDSv3 ----------------------------------------------------
 
@@ -337,8 +495,7 @@ class KnownSetStore:
             out["note"] = "file not found"
             return out
         try:
-            uri = f"file:{path.as_posix()}?mode=ro"
-            conn = sqlite3.connect(uri, uri=True, timeout=30.0)
+            conn = sqlite3.connect(_ro_uri(path), uri=True, timeout=30.0)
         except Exception as exc:  # noqa: BLE001
             out["note"] = f"cannot open as SQLite: {exc}"
             return out
@@ -395,45 +552,67 @@ class KnownSetStore:
                 f"none of {list(algos)} are present; this publication has "
                 f"{info.get('hash_columns')}")
 
-        uri = f"file:{Path(path).as_posix()}?mode=ro"
-        src = sqlite3.connect(uri, uri=True, timeout=30.0)
-        inserted = 0
+        src = sqlite3.connect(_ro_uri(path), uri=True, timeout=30.0)
+        stored = 0
+        skipped = 0
+        cancelled = False
+        total_rows = info.get("n_files", 0)
         try:
             q = f"SELECT {', '.join(cols)} FROM FILE"
             if limit:
                 q += f" LIMIT {int(limit)}"
+            seen_rows = 0
             with self.connect() as conn:
                 set_id = self._begin_set(conn, name, "nsrl", str(path))
-                conn.execute("BEGIN")
-                batch: list[tuple] = []
-                for row in src.execute(q):
-                    if cancel_cb and cancel_cb():
-                        break
-                    for algo, val in zip(cols, row):
-                        n = normalise_hash(val or "")
-                        if n:
-                            batch.append((set_id, n[0], n[1]))
-                    if len(batch) >= 20000:
-                        conn.executemany(
-                            "INSERT OR IGNORE INTO known_hash(set_id, algo, "
-                            "hash) VALUES (?,?,?)", batch)
-                        inserted += len(batch)
-                        batch.clear()
-                        if progress_cb:
-                            progress_cb(inserted)
-                if batch:
-                    conn.executemany(
-                        "INSERT OR IGNORE INTO known_hash(set_id, algo, "
-                        "hash) VALUES (?,?,?)", batch)
-                    inserted += len(batch)
-                conn.execute("COMMIT")
-                conn.execute("UPDATE hash_set SET n_hashes=? WHERE id=?",
-                             (inserted, set_id))
+                try:
+                    conn.execute("BEGIN")
+                    batch: list[tuple] = []
+                    for row in src.execute(q):
+                        if cancel_cb and cancel_cb():
+                            cancelled = True
+                            break
+                        seen_rows += 1
+                        for algo, val in zip(cols, row):
+                            n = normalise_hash(val or "")
+                            if n:
+                                batch.append((set_id, n[0], n[1]))
+                            else:
+                                skipped += 1
+                        if len(batch) >= 20000:
+                            stored += self._flush(conn, batch)
+                            if progress_cb:
+                                progress_cb(stored)
+                    stored += self._flush(conn, batch)
+                    conn.execute("COMMIT")
+                except Exception:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._discard_set(conn, set_id)
+                    raise
+                # A cancelled or limited import must never look complete:
+                # half of NSRL is indistinguishable from all of it unless
+                # the set says so.
+                notes = []
+                if cancelled:
+                    notes.append(f"CANCELLED after {seen_rows:,} of "
+                                 f"{total_rows:,} FILE rows")
+                if limit:
+                    notes.append(f"limited to {int(limit):,} FILE rows")
+                sk = self._skip_note(skipped)
+                if sk:
+                    notes.append(sk)
+                conn.execute("UPDATE hash_set SET source_rows=? WHERE id=?",
+                             (total_rows, set_id))
+                self._finish_set(conn, set_id, name, stored,
+                                 complete=not (cancelled or bool(limit)),
+                                 note="; ".join(notes))
         finally:
             src.close()
         if progress_cb:
-            progress_cb(inserted)
-        return inserted
+            progress_cb(stored)
+        return stored
 
 
 def default_store_path() -> Path:
