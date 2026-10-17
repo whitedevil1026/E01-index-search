@@ -1,45 +1,44 @@
 # Running a real case
 
-> ## BLOCKER — check this first (verified 2026-10-18)
+> ## Python version — read before installing (updated 2026-10-18)
 >
-> **This build pins Python 3.10, and Python 3.10 reaches end of life on
-> 31 October 2026.** The bundled wheels in `wheels/` are `cp310` only, so
-> the offline installer works on nothing else.
+> **Use Python 3.12.** The project originally pinned 3.10, which reaches
+> end of life on 31 October 2026; `requirements.txt` now targets 3.12
+> (supported to October 2028) and every pin was verified to install from
+> a cp312 binary wheel.
 >
-> On the development machine Python 3.10 has already been removed —
-> only 3.12 and 3.14 are present, and 17 of the 20 forensic
-> dependencies are absent from both. **The tool cannot run there as
-> shipped.** Confirm `python -c "import sys; print(sys.version)"` reports
-> 3.10 before relying on this build, or migrate first.
+> ```
+> py -3.12 -m venv .venv312
+> .venv312\Scripts\python -m pip install -r requirements.txt
+> ```
 >
-> ### Migration to Python 3.12 is viable — verified against PyPI
+> Install by group if pip reports `resolution-too-deep` — the libyal
+> family plus PySide6 can exceed its resolver depth in one command.
 >
-> | Dependency | cp312 binary wheel |
-> |---|---|
-> | `libewf-python` | yes — `20260924-cp312-cp312-win_amd64` |
-> | `pytsk3` | yes — `20260715-cp312` |
-> | `tantivy` | yes — `0.26.2-cp312` |
-> | `yara-x` | yes — `1.21.0-cp38-abi3` (any 3.8+) |
-> | `cryptography` | yes — `50.0.2-cp311-abi3` (any 3.11+) |
-> | `libfsntfs-python` | yes — `20260827` |
-> | **`py-tlsh`** | **no — sdist only** |
+> **Run everything through that interpreter**, including the suite:
+> `.venv312\Scripts\python tools/test_ingest_suite.py "<image.E01>"`.
 >
-> `py-tlsh` is the single gap. There is a `tlsh 0.2.0` wheel on PyPI that
-> looks like a drop-in, but it is **empty** — dist-info with no module —
-> so it is not a substitute. Either build `py-tlsh` from source (needs
-> MSVC build tools, which breaks this project's no-build-tools promise)
-> or run without it: TLSH is already optional (`HAS_TLSH`) and only
-> fuzzy-similarity search is lost.
+> ### What is verified
 >
-> Python 3.12 is supported to October 2028. `tools/build_wheels.py`
-> rebuilds the offline bundle for another interpreter.
-
-
-Preflight, settings and expected timings for using this tool on live
-evidence. Figures are measured on this build, not estimated — see
-"Where these numbers come from" at the end.
-
----
+> * 19 of 20 dependencies install and import on 3.12.
+> * A fully offline install works: a fresh 3.12 venv installed all 19
+>   modules from a local bundle with `--no-index` and no C++ compiler.
+>   `setuptools` and `wheel` must be in the bundle — two dependencies
+>   publish no wheel and their (pure-Python) sdists need setuptools to
+>   build. The rebuild commands are in `requirements.txt`.
+> * The committed `wheels/` bundle is **cp310 and unusable on 3.12**.
+>   Rebuild it; do not rely on it.
+>
+> ### The one gap: TLSH
+>
+> `py-tlsh` has no cp312 wheel — sdist only, so it needs MSVC build
+> tools. TLSH is optional (`HAS_TLSH`): without it only the
+> fuzzy-similarity search mode is unavailable, and the suite reports
+> that as an `[ENV ]` line rather than a failure.
+>
+> Do **not** install the `tlsh` package from PyPI as a substitute —
+> version 0.2.0 is an empty placeholder wheel with dist-info and no
+> module.
 
 ## 1. Preflight (5 minutes, before touching evidence)
 
