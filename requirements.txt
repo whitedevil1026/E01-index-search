@@ -1,56 +1,83 @@
-# ==============================================================
-#  E01 Index & Search  —  complete dependency list
+# E01 Index & Search — dependencies
 #
-#  Install EVERYTHING in one command:
-#      pip install -r requirements.txt
+# PYTHON VERSION
+# --------------
+# Targets Python 3.12. The project was originally pinned to 3.10, which
+# reaches end of life on 31 October 2026; every version below was
+# verified to install from a cp312 binary wheel on Windows x64 on
+# 2026-10-18, so no Microsoft C++ Build Tools are needed.
 #
-#  Offline install (uses the pre-built wheels in ./wheels/,
-#  no Microsoft C++ Build Tools needed):
-#      pip install -r requirements.txt --find-links wheels/
+#     py -3.12 -m venv .venv312
+#     .venv312\Scripts\python -m pip install -r requirements.txt
 #
-#  Tested on Windows + Python 3.10 (cp310). The C-extension
-#  packages also have pre-built wheels on PyPI for cp310-cp312.
-# ==============================================================
+# Install one group at a time if pip reports "resolution-too-deep" —
+# the libyal family plus PySide6 can exceed pip's resolver depth when
+# every package is passed in a single command.
+#
+# OFFLINE INSTALL
+# ---------------
+# Bundles live one per interpreter under wheels/: wheels/py312 is the
+# current Python 3.12 bundle and wheels/py310 is the legacy Python 3.10
+# one (a wheel is tagged for one CPython minor version, so each bundle
+# only works on its own interpreter). Install from the 3.12 bundle with
+# no network at all:
+#
+#     .venv312\Scripts\python -m pip install --no-index --find-links wheels/py312 -r requirements.txt
+#
+# To rebuild the 3.12 bundle (needs network once), empty wheels/py312/
+# first so old and new versions do not pile up side by side, then:
+#
+#     py -3.12 -m pip download -r requirements.txt -d wheels/py312 --prefer-binary
+#     py -3.12 -m pip download setuptools wheel -d wheels/py312 --only-binary :all:
+#
+# setuptools and wheel must be in the bundle: two dependencies
+# (red-black-tree-mod, win_unicode_console) publish no wheel, and
+# building their sdists offline needs setuptools present. Both are pure
+# Python, so no C++ compiler is required — verified 2026-10-18, a fresh
+# 3.12 venv installed all 19 modules from the bundle with --no-index.
 
-# ---- GUI ------------------------------------------------------
-# Use Essentials (Core/Gui/Widgets/etc.). The full PySide6 metapackage
-# also pulls in PySide6-Addons (~170 MB, multimedia/charts/web), which
-# this app does not use. Skipping Addons keeps install fast and the
-# offline wheel bundle small.
-PySide6-Essentials>=6.6,<7
+# ---- application framework ------------------------------------------
+PySide6-Essentials>=6.8,<7
 
-# ---- Crypto / signing ----------------------------------------
-cryptography>=42               # Ed25519 signed manifest + AES-GCM at rest
-
-# ---- Search index --------------------------------------------
-tantivy>=0.22,<0.26            # full-text search engine (Rust, Lucene-class)
-
-# ---- Encoding detection --------------------------------------
+# ---- integrity, search, encoding ------------------------------------
+cryptography>=50,<51           # Ed25519 signed manifest
+tantivy>=0.26,<0.27            # full-text search engine (Rust)
 charset-normalizer>=3.4,<4     # per-file text encoding detection
 
-# ---- Fuzzy hashing -------------------------------------------
-python-tlsh                    # TLSH similarity hash ("find similar files")
+# ---- image access ---------------------------------------------------
+# libewf-python was pinned to 20240506 previously; that release has no
+# cp312 wheel. 20260924 does.
+libewf-python>=20260924        # EWF / EnCase .E01 image reader
+pytsk3>=20260715               # The Sleuth Kit filesystem walker
 
-# ---- Image access: E01 reader + Sleuth Kit walker -----------
-libewf-python==20240506        # EWF / EnCase .E01 image reader
-pytsk3>=20230125               # The Sleuth Kit filesystem walker
+# ---- volumes, shadow copies, encrypted containers -------------------
+libvshadow-python>=20260714    # Volume Shadow Copy (VSS) snapshots
+libbde-python>=20260916        # BitLocker volume decryption
+libfvde-python>=20260923       # FileVault 2 volume decryption
+libluksde-python>=20260902     # LUKS volume decryption
+libfsntfs-python>=20260827     # direct NTFS reader (TSK fallback)
+libfsapfs-python>=20260921     # direct APFS reader (TSK fallback)
 
-# ---- Encrypted / shadowed / direct-filesystem readers -------
-libvshadow-python>=20240504    # Volume Shadow Copy (VSS) snapshots
-libbde-python>=20240502        # BitLocker volume decryption
-libfvde-python>=20240502       # FileVault 2 volume decryption
-libluksde-python>=20240503     # LUKS volume decryption
-libfsntfs-python>=20240501     # direct NTFS reader (TSK fallback)
-libfsapfs-python>=20240429     # direct APFS reader (TSK fallback)
+# ---- file content and specialised artefacts -------------------------
+pymupdf>=1.24                  # PDF text extraction
+extract-msg>=0.54,<0.56        # Outlook .msg email parser
+yara-x>=1.21                   # YARA-X rule scanning
+libpff-python>=20260926        # Outlook PST / OST mail stores
+libregf-python>=20260526       # Windows Registry hives
+libesedb-python>=20260704      # ESE databases (Edge / SRUM / Search)
 
-# ---- Content extraction --------------------------------------
-pymupdf                        # PDF text extraction (PyMuPDF)
-extract-msg                    # Outlook .msg email parser
+# ---- optional -------------------------------------------------------
+# TLSH fuzzy-similarity hashing, used by the "find similar files" search
+# mode. There is NO cp312 binary wheel: py-tlsh ships only an sdist, so
+# installing it needs MSVC build tools. The tool detects its absence
+# (HAS_TLSH) and degrades to disabling TLSH search only.
+#
+# Do NOT substitute the `tlsh` package from PyPI — version 0.2.0 is an
+# empty placeholder wheel containing dist-info and no module.
+#
+#   py -3.12 -m pip install py-tlsh      # requires a C++ compiler
+#
+# py-tlsh>=4.5
 
-# ---- Malware / IoC scanning ----------------------------------
-yara-x                         # YARA-X rule scanning
-
-# ---- Specialized artefact parsers ----------------------------
-libpff-python                  # Outlook PST / OST mail stores
-libregf-python>=20240421       # Windows Registry hives
-libesedb-python>=20240420      # ESE databases (Edge / SRUM / Search)
+# psutil is used only by tools/test_ingest_suite.py for memory probing.
+psutil>=7,<8

@@ -16,6 +16,7 @@ from app.ui.case_panel import CasePanel
 from app.ui.ingest_panel import IngestPanel
 from app.ui.search_panel import SearchPanel
 from app.ui.audit_panel import AuditPanel
+from app.ui.known_panel import KnownFilesPanel
 from app.ui.deps_panel import DepsPanel
 from app.ui.integrity_panel import IntegrityPanel
 from app.ui.findings_panel import FindingsPanel
@@ -188,6 +189,7 @@ class MainWindow(QMainWindow):
         self.search_panel = SearchPanel(self)
         self.findings_panel = FindingsPanel(self)
         self.audit_panel = AuditPanel(self)
+        self.known_panel = KnownFilesPanel(self)
         self.deps_panel = DepsPanel(self)
 
         self.tabs.addTab(self.case_panel, "Case")
@@ -196,6 +198,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.search_panel, "Search")
         self.tabs.addTab(self.findings_panel, "Findings")
         self.tabs.addTab(self.audit_panel, "Audit Log")
+        self.tabs.addTab(self.known_panel, "Known Files")
         self.tabs.addTab(self.deps_panel, "Deps Status")
 
         self.setCentralWidget(self.tabs)
@@ -304,5 +307,6 @@ class MainWindow(QMainWindow):
             self.lbl_case.setText("No case loaded — File → New Case or Open Case")
         for panel in (self.case_panel, self.integrity_panel,
                       self.ingest_panel, self.search_panel,
-                      self.findings_panel, self.audit_panel):
+                      self.findings_panel, self.audit_panel,
+                      self.known_panel):
             panel.set_case(case)

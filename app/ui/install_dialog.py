@@ -4,16 +4,21 @@ Runs `python -m pip install <args>` via QProcess after explicit user
 confirmation. Streams stdout/stderr live into a console widget and
 re-probes deps when finished so the parent panel can refresh.
 
-For packages that have no published Windows wheel on PyPI (currently
-`pytsk3` and `python-tlsh`), the repo bundles pre-built .whl files in
-`wheels/`. The install command always passes `--find-links` to
-that directory so pip picks the bundled wheel up automatically — no
-compiler needed.
+The repo bundles pre-built .whl files, one folder per Python version
+(`wheels/py312/`, ...). The install command passes `--find-links` to the
+folder that matches the running interpreter (see `app.core.wheel_bundle`)
+so pip picks the bundled wheel up automatically — no compiler needed. It
+does not pass `--no-index`: a package missing from the bundle falls back
+to PyPI.
+
+An optional dependency whose package is not in the bundle (TLSH on 3.12:
+`py-tlsh` ships only an sdist) starts unticked, because installing it
+needs a C++ compiler. The examiner can still tick it.
 """
 from __future__ import annotations
 
+import re
 import sys
-from pathlib import Path
 
 from PySide6.QtCore import QProcess, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QTextCursor
@@ -23,18 +28,53 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.deps import Dep
-
-
-# The folder that ships pre-built wheels for the C-extension deps that
-# don't have Windows binaries on PyPI. Resolved relative to the
-# project root (two levels up from this file).
-BUNDLED_WHEELS_DIR = (Path(__file__).resolve().parent.parent.parent / "wheels").resolve()
+from app.core.wheel_bundle import (
+    bundle_dir_for, bundle_folder_name, bundle_has, bundle_wheel_names,
+)
 
 
 def bundled_wheel_names() -> list[str]:
-    if not BUNDLED_WHEELS_DIR.is_dir():
-        return []
-    return sorted(p.name for p in BUNDLED_WHEELS_DIR.glob("*.whl"))
+    """Wheel file names in the bundle for the running interpreter."""
+    return bundle_wheel_names()
+
+
+def _pip_args(pip_args: list[str], version: tuple[int, int] | None = None,
+              root=None) -> list[str]:
+    """Full `python` argument list for one `pip install`.
+
+    Passes `--find-links` to the bundle folder for *version* (default: the
+    running interpreter) only when that folder holds wheels, so users on a
+    fresh machine don't need MSVC Build Tools to compile the C-extension
+    packages (pytsk3, the libyal family) from source.
+    """
+    args = ["-m", "pip", "install", "--disable-pip-version-check"]
+    bundle = bundle_dir_for(version, root)
+    if bundle is not None:
+        args.extend(["--find-links", str(bundle)])
+    args.extend(pip_args)
+    return args
+
+
+def _spec_name(spec: str) -> str:
+    """Distribution name at the front of a pip spec (``py-tlsh>=4.5`` -> ``py-tlsh``)."""
+    m = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", spec)
+    return m.group(1) if m else spec
+
+
+def _default_checked(dep: Dep, version: tuple[int, int] | None = None,
+                     root=None) -> bool:
+    """Whether *dep* starts ticked in the installer.
+
+    Required deps: always. Optional deps: only when the bundle for *version*
+    (default: the running interpreter) holds the package, so the default
+    install never kicks off a from-source build that needs a compiler.
+    """
+    if not dep.optional:
+        return True
+    specs = [a for a in dep.pip_args if not a.startswith("-")]
+    return bool(specs) and all(
+        bundle_has(_spec_name(s), version, root) for s in specs
+    )
 
 
 class InstallDialog(QDialog):
@@ -64,7 +104,8 @@ class InstallDialog(QDialog):
         if wheels:
             wheels_note = (
                 "<br><br><b>Bundled wheels available</b> "
-                f"({len(wheels)} file(s) in <code>./wheels/</code>): "
+                f"({len(wheels)} file(s) for your Python version in "
+                f"<code>wheels/{bundle_folder_name()}/</code>): "
                 + ", ".join(f"<code>{w}</code>" for w in wheels)
                 + ". These will be used automatically &mdash; no compiler needed."
             )
@@ -94,7 +135,7 @@ class InstallDialog(QDialog):
         for d in missing:
             row = QHBoxLayout()
             cb = QCheckBox(f"{d.name}    ({' '.join(d.pip_args)})")
-            cb.setChecked(True)
+            cb.setChecked(_default_checked(d))
             row.addWidget(cb)
             row.addStretch(1)
             sel_layout.addLayout(row)
@@ -182,13 +223,7 @@ class InstallDialog(QDialog):
             return
         self._current = self._queue.pop(0)
         d = self._current
-        args = ["-m", "pip", "install", "--disable-pip-version-check"]
-        # Use bundled wheels (./wheels/) when available so users on a
-        # fresh machine don't need MSVC Build Tools just to compile
-        # pytsk3 / python-tlsh from source.
-        if BUNDLED_WHEELS_DIR.is_dir() and any(BUNDLED_WHEELS_DIR.glob("*.whl")):
-            args.extend(["--find-links", str(BUNDLED_WHEELS_DIR)])
-        args.extend(d.pip_args)
+        args = _pip_args(d.pip_args)
         self._write_console(
             f"\n# ───── installing {d.name} ─────\n"
             f"$ \"{sys.executable}\" {' '.join(args)}\n"

@@ -1,0 +1,2 @@
+pytest>=8
+packaging>=24  # tests/test_deps_bundle.py parses wheel names and pip specs

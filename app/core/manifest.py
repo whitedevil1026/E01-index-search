@@ -43,16 +43,16 @@ def ensure_keypair(keys_dir: Path) -> tuple[Ed25519PrivateKey, Ed25519PublicKey]
     return priv, priv.public_key()
 
 
-def _hash_file(path: Path, limit: int = 64 * 1024 * 1024) -> str:
+def _hash_file(path: Path) -> str:
+    # Hashes to EOF. A partial hash would be signed as if it
+    # authenticated the whole file, which defeats the manifest.
     h = hashlib.sha256()
-    n = 0
     with open(path, "rb") as f:
-        while n < limit:
+        while True:
             chunk = f.read(1 << 20)
             if not chunk:
                 break
             h.update(chunk)
-            n += len(chunk)
     return h.hexdigest()
 
 

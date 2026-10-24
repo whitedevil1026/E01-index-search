@@ -66,6 +66,27 @@ htmlcov/
 # OS
 desktop.ini
 
-# But DO commit the bundled wheels — they're the whole point of wheels/
+# But DO commit the bundled wheels — they're the whole point of wheels/.
+# Only wheel / sdist files and the README are un-ignored, so evidence-image
+# patterns and build/ above still apply inside wheels/.
 !wheels/
-!wheels/*.whl
+!wheels/*/
+!wheels/**/*.whl
+!wheels/**/*.tar.gz
+!wheels/**/*.zip
+!wheels/README.md
+
+# Scratch cases written by tools/test_ingest_suite.py
+_suite_work/
+
+# Python 3.12 migration virtualenv (local only)
+.venv312/
+
+# Local known-file hash store — reference data, not source. Rebuilt by
+# importing hash sets in the Known Files tab; can reach many GB.
+known_sets.db
+known_sets.db-wal
+known_sets.db-shm
+
+# Suite output files
+run[0-9]*.txt
