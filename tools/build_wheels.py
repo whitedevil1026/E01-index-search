@@ -1,13 +1,20 @@
 """Build the C-extension wheels (pytsk3, tlsh) for the current Python
-interpreter from source.
+interpreter from source and ADD them to that interpreter's bundle.
 
 Output goes into a per-interpreter folder, wheels/py{major}{minor}/
 (for example wheels/py312/ when run under Python 3.12), so bundles built
 for different Python versions never mix. The installer reads the same
 folder for the interpreter it runs under.
 
-Run this once per Python version on a machine that has the build
-toolchain (Windows: VS Build Tools with the 'Desktop development with
+This only adds two wheels to an existing bundle; it does not create one.
+Populate the folder first with the `pip download` commands in
+requirements.txt. Do not let this script's output be the only thing in a
+new wheels/py3XX/ folder: the resolver (app/core/wheel_bundle.py) treats
+any folder holding a .whl as a full bundle, so a 2-wheel folder would be
+offered as the bundle and an offline install would find nothing else.
+
+Needs a C++ compiler: run it on a machine with the build toolchain
+(Windows: Microsoft C++ Build Tools with the 'Desktop development with
 C++' workload). The resulting .whl files can be checked into the repo so
 end users never need to compile anything.
 

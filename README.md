@@ -34,10 +34,13 @@ pip install -r requirements.txt
 
 ### Fully offline install (no internet, no compiler)
 
-Every dependency — including all transitive dependencies — is bundled
-as a pre-built wheel in [`wheels/py312/`](wheels/py312/), the bundle for
-Python 3.12 (see [`wheels/README.md`](wheels/README.md)). To install the
-tool without touching the network at all:
+Every dependency in `requirements.txt` — including all transitive
+dependencies — is bundled in [`wheels/py312/`](wheels/py312/), the bundle
+for Python 3.12 (see [`wheels/README.md`](wheels/README.md)). The one
+exception is the optional TLSH package (`py-tlsh`): it has no cp312
+wheel, so TLSH fuzzy-similarity search is unavailable on an offline 3.12
+install; everything else works. To install the tool without touching the
+network at all:
 
 ```
 pip install -r requirements.txt --find-links wheels/py312 --no-index
@@ -93,10 +96,16 @@ fix it:
 2. Click **Install Missing…**.
 3. In the dialog, click **Install Now**.
 
-It installs the eleven C-extension packages from the pre-built wheels
-in `wheels/py{major}{minor}/` for the Python it runs under (for
-example `wheels/py312/`) — **offline, in seconds, with no Microsoft C++
-Build Tools**. pip output streams live in the dialog.
+It installs the missing packages, pointing pip at the bundle in
+`wheels/py{major}{minor}/` for the Python it runs under (for example
+`wheels/py312/`). Every compiled package the tool needs — PySide6,
+cryptography, tantivy, pytsk3, the libyal readers and the rest — comes
+from a pre-built wheel there, so **no Microsoft C++ Build Tools** are
+needed. The exception is the optional TLSH package (`py-tlsh`), which has
+no 3.12 wheel; the dialog leaves it unticked. The installer passes
+`--find-links` but not `--no-index`, so pip may still contact PyPI; for a
+strictly offline install use Option B. pip output streams live in the
+dialog.
 
 ### Option B — pip on the command line
 
@@ -138,7 +147,7 @@ Everything is in [`requirements.txt`](requirements.txt). Summary:
 | `cryptography` | Ed25519 signed manifest, AES-GCM encryption at rest |
 | `tantivy` | Full-text search index |
 | `charset-normalizer` | Text encoding detection |
-| `python-tlsh` | TLSH fuzzy-similarity hashing |
+| `py-tlsh` *(optional, not bundled on 3.12)* | TLSH fuzzy-similarity hashing — needs a C++ compiler on 3.12 |
 | `libewf-python` | EWF / EnCase `.E01` image reader |
 | `pytsk3` | The Sleuth Kit filesystem walker |
 | `libvshadow-python` | Volume Shadow Copy (VSS) snapshots |
@@ -155,13 +164,15 @@ Everything is in [`requirements.txt`](requirements.txt). Summary:
 | `libesedb-python` | ESE databases (Edge / SRUM / Windows Search) |
 
 **Every** dependency above — plus all transitive dependencies — ships
-as a pre-built **cp312 / win_amd64** wheel in
-[`wheels/py312/`](wheels/py312/) (~120 MB, 43 files). A fully
-air-gapped Windows + Python 3.12 install with `--no-index` works out of
-the box: no internet, no Microsoft C++ Build Tools. The one exception is
-`python-tlsh`, which has no cp312 wheel, so TLSH fuzzy-similarity
-search is unavailable on 3.12; the legacy `wheels/py310` bundle still
-carries it.
+in [`wheels/py312/`](wheels/py312/) (~120 MB, 43 files). The bundle
+mixes cp312 wheels, abi3 wheels and pure-Python `py3-none-any` wheels,
+plus two pure-Python source packages (`red-black-tree-mod`,
+`win_unicode_console`) that pip builds with the bundled `setuptools` and
+`wheel`. A fully air-gapped Windows + Python 3.12 install with
+`--no-index` works out of the box: no internet, no Microsoft C++ Build
+Tools. The one exception is the optional `py-tlsh`, which has no cp312
+wheel, so TLSH fuzzy-similarity search is unavailable on 3.12; the
+legacy `wheels/py310` bundle still carries a prebuilt TLSH wheel.
 
 ---
 

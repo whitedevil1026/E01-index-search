@@ -24,7 +24,8 @@
 #
 #     .venv312\Scripts\python -m pip install --no-index --find-links wheels/py312 -r requirements.txt
 #
-# To rebuild the 3.12 bundle (needs network once):
+# To rebuild the 3.12 bundle (needs network once), empty wheels/py312/
+# first so old and new versions do not pile up side by side, then:
 #
 #     py -3.12 -m pip download -r requirements.txt -d wheels/py312 --prefer-binary
 #     py -3.12 -m pip download setuptools wheel -d wheels/py312 --only-binary :all:
