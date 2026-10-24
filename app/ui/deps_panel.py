@@ -52,8 +52,8 @@ class DepsPanel(QWidget):
         self.btn_install = QPushButton("Install Missing…")
         self.btn_install.setToolTip(
             "Run `python -m pip install` against the missing packages, "
-            "preferring the bundled wheels in ./wheels/ first so no MSVC "
-            "build tools are needed."
+            "preferring the bundle for your Python version in wheels/py{XY}/ "
+            "first so no MSVC build tools are needed."
         )
         self.btn_install.clicked.connect(self._open_installer)
         self.btn_refresh = QPushButton("Re-probe")

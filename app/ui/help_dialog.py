@@ -40,7 +40,9 @@ manifest.</p>
 <h3>Bundled wheels</h3>
 <p>The repo ships pre-built Windows wheels for <code>pytsk3</code> and
 <code>tlsh</code> so end users install in seconds with no Visual C++
-Build Tools. See the <b>Deps Status</b> tab.</p>
+Build Tools. Use the bundle for your Python version in
+<code>wheels/py{XY}/</code> (for example <code>wheels/py312/</code>).
+See the <b>Deps Status</b> tab.</p>
 
 <h3>License attribution</h3>
 <p>See the <code>NOTICE</code> file at the repo root for the full

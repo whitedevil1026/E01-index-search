@@ -6,8 +6,12 @@ what to pip install.
 """
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
+
+from app.core.wheel_bundle import bundle_dir_for, is_legacy
 
 
 @dataclass
@@ -39,30 +43,31 @@ def _probe(module_name: str, purpose: str, pip_args: list[str],
 
 
 # Note for the C-extension packages (`pytsk3`, `python-tlsh`).
-# We ship pre-built wheels for Python 3.10/win_amd64 in `wheels/`,
-# so the typical user installs them from the bundle with no compiler.
-# The MSVC fallback only matters if a user runs a Python version we
-# haven't pre-built for.
-def _bundled_wheels_exist() -> bool:
-    from pathlib import Path
-    here = Path(__file__).resolve().parent.parent.parent / "wheels"
-    return here.is_dir() and any(here.glob("*.whl"))
-
-
-_BUNDLED_NOTE = (
-    "Bundled wheel available in ./wheels/ — installs offline, no compiler "
-    "needed. Click 'Install Missing' to use it."
-)
-_MSVC_NOTE = (
-    "No bundled wheel for your Python version. Either (a) switch to Python "
-    "3.10 to use the bundled wheel, or (b) install Microsoft C++ Build Tools "
-    "(https://visualstudio.microsoft.com/visual-cpp-build-tools/) and pip "
-    "will compile from source. Optional — features degrade gracefully."
-)
-
-
-def _c_ext_note() -> str:
-    return _BUNDLED_NOTE if _bundled_wheels_exist() else _MSVC_NOTE
+# Pre-built wheels ship one folder per Python version under `wheels/`
+# (see app/core/wheel_bundle.py), so the typical user installs from the
+# bundle with no compiler. The MSVC fallback only matters for a Python
+# version we haven't pre-built for.
+def _c_ext_note(version: tuple[int, int] | None = None,
+                root: Path | None = None) -> str:
+    major, minor = version if version is not None else sys.version_info[:2]
+    if bundle_dir_for((major, minor), root) is not None:
+        note = (
+            f"Bundled wheel available in wheels/py{major}{minor}/ - installs "
+            "offline, no compiler needed. Click 'Install Missing' to use it."
+        )
+        if is_legacy((major, minor)):
+            note += (
+                " This is a legacy bundle - Python 3.10 reaches end of life "
+                "on 31 October 2026; move to the current Python when you can."
+            )
+        return note
+    return (
+        f"No bundled wheel for Python {major}.{minor}. Either use a Python "
+        "version that has a bundle in wheels/, or install Microsoft C++ Build "
+        "Tools (https://visualstudio.microsoft.com/visual-cpp-build-tools/) "
+        "and pip will compile from source. requirements.txt lists the "
+        "commands to rebuild a bundle. Optional - features degrade gracefully."
+    )
 
 
 def probe_all() -> list[Dep]:
