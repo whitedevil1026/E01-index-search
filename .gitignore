@@ -66,9 +66,15 @@ htmlcov/
 # OS
 desktop.ini
 
-# But DO commit the bundled wheels — they're the whole point of wheels/
+# But DO commit the bundled wheels — they're the whole point of wheels/.
+# Only wheel / sdist files and the README are un-ignored, so evidence-image
+# patterns and build/ above still apply inside wheels/.
 !wheels/
-!wheels/**
+!wheels/*/
+!wheels/**/*.whl
+!wheels/**/*.tar.gz
+!wheels/**/*.zip
+!wheels/README.md
 
 # Scratch cases written by tools/test_ingest_suite.py
 _suite_work/
