@@ -8,6 +8,8 @@ from PySide6.QtWidgets import (
     QTextBrowser, QVBoxLayout, QWidget,
 )
 
+from app.core.wheel_bundle import bundle_folder_name
+
 
 __VERSION__ = "1.0.0"
 
@@ -38,11 +40,15 @@ manifest.</p>
 </ul>
 
 <h3>Bundled wheels</h3>
-<p>The repo ships pre-built Windows wheels for <code>pytsk3</code> and
-<code>tlsh</code> so end users install in seconds with no Visual C++
-Build Tools. Use the bundle for your Python version in
-<code>wheels/py{XY}/</code> (for example <code>wheels/py312/</code>).
-See the <b>Deps Status</b> tab.</p>
+<p>The repo ships pre-built Windows wheels, one bundle per Python
+version, so end users install in seconds with no Visual C++ Build
+Tools. The bundle for this Python is
+<code>wheels/{bundle_folder_name()}/</code>. The current
+<code>wheels/py312/</code> bundle has <b>no TLSH wheel</b>
+(<code>py-tlsh</code> publishes only a source package, which needs a
+C++ compiler), so TLSH similarity search is unavailable there; the
+legacy <code>wheels/py310/</code> bundle holds the only prebuilt TLSH
+wheel. See the <b>Deps Status</b> tab.</p>
 
 <h3>License attribution</h3>
 <p>See the <code>NOTICE</code> file at the repo root for the full

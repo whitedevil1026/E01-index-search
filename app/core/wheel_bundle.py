@@ -11,6 +11,7 @@ installed, so it must not import anything that is not already there.
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -20,9 +21,14 @@ WHEELS_ROOT: Path = Path(__file__).resolve().parent.parent.parent / "wheels"
 LEGACY_VERSIONS: frozenset[tuple[int, int]] = frozenset({(3, 10)})
 
 
-def _resolve(version: tuple[int, int] | None, root: Path | None) -> Path:
+def bundle_folder_name(version: tuple[int, int] | None = None) -> str:
+    """Bundle folder name for *version* (default: running interpreter), e.g. ``py312``."""
     major, minor = version if version is not None else sys.version_info[:2]
-    return (root if root is not None else WHEELS_ROOT) / f"py{major}{minor}"
+    return f"py{major}{minor}"
+
+
+def _resolve(version: tuple[int, int] | None, root: Path | None) -> Path:
+    return (root if root is not None else WHEELS_ROOT) / bundle_folder_name(version)
 
 
 def bundle_wheel_names(
@@ -47,3 +53,47 @@ def bundle_dir_for(
 def is_legacy(version: tuple[int, int]) -> bool:
     """True if *version* is a legacy interpreter whose bundle is kept for compatibility."""
     return tuple(version) in LEGACY_VERSIONS
+
+
+_SDIST_SUFFIXES = (".tar.gz", ".zip")
+
+
+def _canonical(name: str) -> str:
+    """PEP 503 normalised distribution name (same rule as ``packaging``)."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _dist_name(filename: str) -> str | None:
+    """Canonical distribution name of a wheel or sdist file name, else ``None``.
+
+    A wheel name never contains ``-`` inside the distribution part, so it is
+    everything before the first ``-``. An sdist may (``red-black-tree-mod-1.22``),
+    so it is everything before the last ``-``.
+    """
+    if filename.endswith(".whl"):
+        return _canonical(filename.split("-", 1)[0])
+    for suffix in _SDIST_SUFFIXES:
+        if filename.endswith(suffix):
+            stem = filename[: -len(suffix)]
+            if "-" not in stem:
+                return None
+            return _canonical(stem.rsplit("-", 1)[0])
+    return None
+
+
+def bundle_has(
+    dist_name: str, version: tuple[int, int] | None = None, root: Path | None = None
+) -> bool:
+    """True if the bundle for interpreter *version* holds a wheel or sdist of *dist_name*.
+
+    Names are compared PEP 503-normalised, so ``libewf-python`` matches
+    ``libewf_python-...whl``. *version* is the interpreter (``(3, 12)``), not
+    the package version; it defaults to the running interpreter.
+    """
+    folder = _resolve(version, root)
+    if not folder.is_dir():
+        return False
+    want = _canonical(dist_name)
+    return any(
+        p.is_file() and _dist_name(p.name) == want for p in folder.iterdir()
+    )

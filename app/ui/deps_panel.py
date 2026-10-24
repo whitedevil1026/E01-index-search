@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.deps import probe_all, missing
+from app.core.wheel_bundle import bundle_folder_name
 from app.ui.centered_msg import msg_info, msg_question
 from app.ui.install_dialog import InstallDialog
 
@@ -52,8 +53,9 @@ class DepsPanel(QWidget):
         self.btn_install = QPushButton("Install Missing…")
         self.btn_install.setToolTip(
             "Run `python -m pip install` against the missing packages, "
-            "preferring the bundle for your Python version in wheels/py{XY}/ "
-            "first so no MSVC build tools are needed."
+            "preferring the bundle for your Python version in "
+            f"wheels/{bundle_folder_name()}/ first so no MSVC build tools "
+            "are needed."
         )
         self.btn_install.clicked.connect(self._open_installer)
         self.btn_refresh = QPushButton("Re-probe")
