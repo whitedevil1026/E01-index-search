@@ -26,8 +26,11 @@
 >   `setuptools` and `wheel` must be in the bundle — two dependencies
 >   publish no wheel and their (pure-Python) sdists need setuptools to
 >   build. The rebuild commands are in `requirements.txt`.
-> * The committed `wheels/` bundle is **cp310 and unusable on 3.12**.
->   Rebuild it; do not rely on it.
+> * Offline bundles are kept one per interpreter. `wheels/py312` is the
+>   current bundle and installs on 3.12 with `--no-index`;
+>   `wheels/py310` is the legacy Python 3.10 bundle (3.10 reaches end of
+>   life on 31 October 2026) and cannot be used on 3.12. To rebuild
+>   `wheels/py312`, use the commands in `requirements.txt`.
 >
 > ### The one gap: TLSH
 >

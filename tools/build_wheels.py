@@ -1,9 +1,14 @@
-"""Build the bundled C-extension wheels (pytsk3, tlsh) for the current
-Python interpreter and drop them into ../wheels/.
+"""Build the C-extension wheels (pytsk3, tlsh) for the current Python
+interpreter from source.
+
+Output goes into a per-interpreter folder, wheels/py{major}{minor}/
+(for example wheels/py312/ when run under Python 3.12), so bundles built
+for different Python versions never mix. The installer reads the same
+folder for the interpreter it runs under.
 
 Run this once per Python version on a machine that has the build
 toolchain (Windows: VS Build Tools with the 'Desktop development with
-C++' workload). The resulting .whl files are checked into the repo so
+C++' workload). The resulting .whl files can be checked into the repo so
 end users never need to compile anything.
 
 Usage:
@@ -21,7 +26,14 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-WHEELS_DIR = REPO_ROOT / "wheels"
+# Run as a script, sys.path[0] is tools/, not the repo root; add the root
+# so the shared bundle layout (app/core/wheel_bundle.py) can be imported.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from app.core.wheel_bundle import WHEELS_ROOT  # noqa: E402
+
+WHEELS_DIR = WHEELS_ROOT / f"py{sys.version_info.major}{sys.version_info.minor}"
 
 # Each entry is (display_name, pip-install-spec). The tlsh entry uses
 # the upstream Trend Micro repo because the PyPI sdist for python-tlsh
@@ -53,7 +65,7 @@ def main() -> int:
         print()
 
     # Show what's in the wheels folder
-    print("Bundled wheels now in repo:")
+    print(f"Wheels now in {WHEELS_DIR.name}/:")
     for w in sorted(WHEELS_DIR.glob("*.whl")):
         kb = w.stat().st_size / 1024
         print(f"  {w.name}  ({kb:,.0f} KB)")

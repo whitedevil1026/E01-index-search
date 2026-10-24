@@ -13,8 +13,9 @@ Licensed under the **[Apache License 2.0](LICENSE)**.
 
 ## 1. Requirements
 
-- **Windows** with **Python 3.10** (64-bit). Other Python versions
-  work too — see [section 5](#5-if-dependencies-are-missing).
+- **Windows** with **Python 3.12** (64-bit). Other Python versions
+  are covered under "Python versions" in
+  [section 5](#5-if-dependencies-are-missing).
 - The Python packages listed in [`requirements.txt`](requirements.txt)
   (installed in the next step).
 
@@ -34,15 +35,16 @@ pip install -r requirements.txt
 ### Fully offline install (no internet, no compiler)
 
 Every dependency — including all transitive dependencies — is bundled
-as a pre-built wheel in [`wheels/`](wheels/). To install the tool
-without touching the network at all:
+as a pre-built wheel in [`wheels/py312/`](wheels/py312/), the bundle for
+Python 3.12 (see [`wheels/README.md`](wheels/README.md)). To install the
+tool without touching the network at all:
 
 ```
-pip install -r requirements.txt --find-links wheels/ --no-index
+pip install -r requirements.txt --find-links wheels/py312 --no-index
 ```
 
 The `--no-index` flag tells pip to ignore PyPI and use only the
-bundled wheels. This works on a fresh Windows + Python 3.10 machine
+bundled wheels. This works on a fresh Windows + Python 3.12 machine
 with no internet and no Microsoft C++ Build Tools.
 
 ---
@@ -92,13 +94,14 @@ fix it:
 3. In the dialog, click **Install Now**.
 
 It installs the eleven C-extension packages from the pre-built wheels
-in `wheels/` — **offline, in seconds, with no Microsoft C++ Build
-Tools**. pip output streams live in the dialog.
+in `wheels/py{major}{minor}/` for the Python it runs under (for
+example `wheels/py312/`) — **offline, in seconds, with no Microsoft C++
+Build Tools**. pip output streams live in the dialog.
 
 ### Option B — pip on the command line
 
 ```
-pip install -r requirements.txt --find-links wheels/ --no-index
+pip install -r requirements.txt --find-links wheels/py312 --no-index
 ```
 
 Adding `--no-index` makes pip use only the bundled wheels (no network).
@@ -110,17 +113,18 @@ flags to fetch everything from PyPI.
 The **Deps Status** tab shows the exact `pip install` command for each
 missing package — copy and run it.
 
-### Using a Python version other than 3.10
+### Python versions
 
-The bundled wheels in `wheels/` are built for **Python 3.10
-(cp310, 64-bit)**. On Python 3.11 / 3.12 / 3.13, most packages still
-install straight from PyPI with `pip install -r requirements.txt`.
-If a C-extension package has no wheel for your version, rebuild the
-bundle once on a machine that has the MSVC toolchain:
+A compiled wheel is tagged for one Python minor version, so bundles are
+kept one per interpreter under `wheels/`:
 
-```
-py -3.12 tools/build_wheels.py
-```
+- **Python 3.12 — current.** `wheels/py312` installs fully offline.
+- **Python 3.10 — legacy.** `wheels/py310` is kept for older installs
+  only; Python 3.10 reaches end of life on 31 October 2026.
+- **Any other version** installs from PyPI with
+  `pip install -r requirements.txt`, or from a bundle you rebuild with
+  the `pip download` commands in the "OFFLINE INSTALL" section of
+  [`requirements.txt`](requirements.txt).
 
 ---
 
@@ -151,10 +155,13 @@ Everything is in [`requirements.txt`](requirements.txt). Summary:
 | `libesedb-python` | ESE databases (Edge / SRUM / Windows Search) |
 
 **Every** dependency above — plus all transitive dependencies — ships
-as a pre-built **cp310 / win_amd64** wheel in [`wheels/`](wheels/)
-(~115 MB, 40 wheels). A fully air-gapped Windows + Python 3.10
-install with `--no-index` works out of the box: no internet, no
-Microsoft C++ Build Tools.
+as a pre-built **cp312 / win_amd64** wheel in
+[`wheels/py312/`](wheels/py312/) (~120 MB, 43 files). A fully
+air-gapped Windows + Python 3.12 install with `--no-index` works out of
+the box: no internet, no Microsoft C++ Build Tools. The one exception is
+`python-tlsh`, which has no cp312 wheel, so TLSH fuzzy-similarity
+search is unavailable on 3.12; the legacy `wheels/py310` bundle still
+carries it.
 
 ---
 

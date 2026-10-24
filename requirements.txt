@@ -16,15 +16,18 @@
 #
 # OFFLINE INSTALL
 # ---------------
-# The committed wheels/ bundle is cp310 and is therefore dead weight on
-# 3.12. Rebuild a 3.12 bundle in one command (needs network once):
+# Bundles live one per interpreter under wheels/: wheels/py312 is the
+# current Python 3.12 bundle and wheels/py310 is the legacy Python 3.10
+# one (a wheel is tagged for one CPython minor version, so each bundle
+# only works on its own interpreter). Install from the 3.12 bundle with
+# no network at all:
 #
-#     py -3.12 -m pip download -r requirements.txt -d wheels312 --prefer-binary
-#     py -3.12 -m pip download setuptools wheel -d wheels312 --only-binary :all:
+#     .venv312\Scripts\python -m pip install --no-index --find-links wheels/py312 -r requirements.txt
 #
-# then install with no network at all:
+# To rebuild the 3.12 bundle (needs network once):
 #
-#     .venv312\Scripts\python -m pip install --no-index --find-links wheels312 -r requirements.txt
+#     py -3.12 -m pip download -r requirements.txt -d wheels/py312 --prefer-binary
+#     py -3.12 -m pip download setuptools wheel -d wheels/py312 --only-binary :all:
 #
 # setuptools and wheel must be in the bundle: two dependencies
 # (red-black-tree-mod, win_unicode_console) publish no wheel, and
