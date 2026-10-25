@@ -24,7 +24,7 @@ Licensed under the **[Apache License 2.0](LICENSE)**.
 ## 2. Install
 
 ```
-git clone https://github.com/whitedevil1026/E01-index-search.git
+git clone https://github.com/KotlaAvinash/E01-index-search.git
 cd E01-index-search
 pip install -r requirements.txt
 ```

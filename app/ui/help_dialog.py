@@ -20,7 +20,7 @@ HELP: dict[str, dict[str, str]] = {
 <h2>E01 Index &amp; Search</h2>
 <p><b>Version:</b> {__VERSION__}<br>
 <b>License:</b> Apache 2.0<br>
-<b>Source:</b> <a href="https://github.com/whitedevil1026/E01-index-search">github.com/whitedevil1026/E01-index-search</a></p>
+<b>Source:</b> <a href="https://github.com/KotlaAvinash/E01-index-search">github.com/KotlaAvinash/E01-index-search</a></p>
 
 <h3>What it does</h3>
 <p>A self-contained desktop forensic indexer for <b>EWF / EnCase E01</b>
